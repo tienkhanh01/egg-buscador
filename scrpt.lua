@@ -1,4 +1,4 @@
--- VORYKEN SCANNER • HOP OPTIMIZADO v3 • register new users reliably + timed hop
+-- VORYKEN SCANNER • FIREBASE FIX v4 • bounded HTTP + teleport retries + diagnostics
 
 -- Voryken Egg Finder • Voryken API-only bootstrap
 -- Caches this exact build so Server Hop never falls back to an older remote loader.
@@ -2718,14 +2718,23 @@ local function firebaseHttp(method, url, value, headers)
     local requestFn = getRequester()
     if type(requestFn) ~= "function" then return false, nil, 0, "EXECUTOR_HTTP_UNAVAILABLE" end
     local args = {
-        Url = url, Method = tostring(method or "GET"), Timeout = 8,
+        Url = url, Method = tostring(method or "GET"), Timeout = 6,
         Headers = headers or { ["Accept"] = "application/json" }
     }
     if value ~= nil then
         args.Body = type(value) == "string" and value or HttpService:JSONEncode(value)
         args.Headers["Content-Type"] = args.Headers["Content-Type"] or "application/json"
     end
-    local ok, result = pcall(requestFn, args)
+    -- Some executors ignore request.Timeout. Bound our wait independently so
+    -- a stuck HTTP call never freezes scanning or delays a Roblox teleport.
+    local finished, ok, result = false, false, nil
+    task.spawn(function()
+        ok, result = pcall(requestFn, args)
+        finished = true
+    end)
+    local deadline = os.clock() + 7
+    while not finished and os.clock() < deadline do task.wait(0.05) end
+    if not finished then return false, nil, 0, "FIREBASE_CLIENT_TIMEOUT_7S" end
     if not ok then return false, nil, 0, tostring(result) end
     local code = type(result) == "table" and tonumber(result.StatusCode or result.Status or result.status) or 200
     local raw = type(result) == "table" and (result.Body or result.body or result.ResponseBody) or result
@@ -2973,14 +2982,17 @@ local function publishEntryToApi(entry, threshold)
         .. "/" .. apiSafeKey(uid)
         .. ".json"
 
-    local lastStatus = nil
-    for attempt = 1, 3 do
-        local ok, _data, status = VorykenStore.request("PUT", url, payload)
-        if ok then return true, status end
-        lastStatus = status
-        if attempt < 3 then task.wait(0.15 * attempt) end
+    -- One request per attempt. Fast failure must not stall the hop forever.
+    -- The caller decides whether to retry this UID on a later scan.
+    local ok, _data, status, reason = VorykenStore.request("PUT", url, payload)
+    if ok then
+        runtimeState._lastEggPublishError = nil
+        return true, status
     end
-    return false, lastStatus
+    local detail = tostring(reason or ("HTTP_" .. tostring(status or "NO_STATUS")))
+    runtimeState._lastEggPublishError = detail
+    warn("[VORYKEN REPORT] Finder-2 PUT failed: " .. detail:sub(1, 180))
+    return false, detail
 
 end
 
@@ -3909,6 +3921,8 @@ local autoQueueBusy = false
 -- Shared across re-executions in the SAME server.
 local autoNotifiedUids = runtimeState.AutoNotifiedUids
 local apiPublishedUids = runtimeState.ApiPublishedUids
+runtimeState.ReportRetryAt = runtimeState.ReportRetryAt or {}
+local reportRetryAt = runtimeState.ReportRetryAt
 local serverHopBusy = false
 local serverHopQueuedAfterSend = false
 local lastServerHopAttempt = 0
@@ -4435,7 +4449,7 @@ function runtimeState._queueServerHopRetry(reason, delaySeconds)
     if failedJob and failedClaim then
         task.spawn(function()
             local claimUrl = VORYKEN_API_ROOT .. "/finder/claims/" .. tostring(FirebaseQueue.uid) .. ".json"
-            for attempt = 1, 4 do
+            for attempt = 1, 3 do
                 if tostring(game.JobId or "") == failedJob then return end
                 local ok, fresh = runtimeState.ApiQueue.rawRequest("GET", claimUrl)
                 if ok and type(fresh) == "table" and tostring(fresh.claimId or "") == failedClaim then
@@ -4473,7 +4487,7 @@ function runtimeState._waitForAllCurrentServerEggs(originJobId)
     -- No artificial 2-second settling time. As soon as the current normal
     -- egg UIDs have corresponding EggState records and Halloween is scanned,
     -- the server is ready to hop. Unmapped UIDs still wait (up to MAX_WAIT).
-    local MAX_WAIT = 30.0
+    local MAX_WAIT = 9.0
 
     while serverHopEnabled
         and screen.Parent
@@ -4601,13 +4615,13 @@ attemptTeleportCurrent = function(originJob)
     -- pcall success means the request was STARTED, not that Roblox joined.
     -- The destination scanner heartbeat is what confirms the join in Python.
     hopMeasureStage("waiting for Roblox transfer")
-    task.delay(12, function()
+    task.delay(9, function()
         if not serverHopBusy or serverHopCurrentTarget ~= target
             or serverHopTeleportAttempts ~= attempt
             or tostring(game.JobId or "") ~= tostring(originJob) then return end
         if serverHopTeleportStarted then
             -- The engine reported a loading/teleport state; allow extra time.
-            task.delay(20, function()
+            task.delay(13, function()
                 if serverHopBusy and serverHopCurrentTarget == target
                     and serverHopTeleportAttempts == attempt
                     and tostring(game.JobId or "") == tostring(originJob) then
@@ -4615,7 +4629,7 @@ attemptTeleportCurrent = function(originJob)
                 end
             end)
         else
-            handleTeleportFailure("NO_TRANSFER_12S", false, 1.0)
+            handleTeleportFailure("NO_TRANSFER_9S", false, 1.0)
         end
     end)
 end
@@ -4681,8 +4695,7 @@ runtimeState._performServerHop = function(reason)
         local env = (type(getgenv) == "function" and getgenv()) or _G
         local verifiedStartup = type(env) == "table"
             and tostring(env.__VorykenScannerWorldReadyJob or "") == originJobId
-        if tostring(reason or "") == "MATCH_SENT" and verifiedStartup
-            and (tonumber(runtimeState._lastScannerEggCount) or 0) > 0 then
+        if verifiedStartup then
             eggsReady = true
             eggInfo = runtimeState._lastScannerEggCount
             hopMeasureStage("eggs previously verified")
@@ -4833,8 +4846,9 @@ runtimeState._performServerHop = function(reason)
 
         local queued = queueFinderForNextServer()
         if not queued then
-            filterStatus.Text = "Server Hop • teleport queue unavailable"
+            filterStatus.Text = "HOP WARNING • autoexecute unavailable; configure executor Auto Execute"
             filterStatus.TextColor3 = Color3.fromRGB(255, 181, 82)
+            warn("[VORYKEN HOP] queue_on_teleport unavailable. Destination scanner will need executor Auto Execute.")
         end
 
         -- Do not consume Firebase assignment before the destination server
@@ -5165,34 +5179,41 @@ function runtimeState._processAutomaticNotifications(topEntries, allEntries)
             matchingCount += 1
 
             if not apiPublishedUids[uid] then
-                apiPublishedUids[uid] = {
-                    JobId = currentJobId,
-                    ReservedAt = os.clock(),
-                    Name = tostring(entry.name or ""),
-                }
-
-                filterStatus.Text = "Voryken API • " .. tostring(entry.name)
-                filterStatus.TextColor3 = COLORS.Gray
-
-                local ok = publishEntryToApi(runtimeState._cloneEntry(entry), threshold)
-                if not ok then
+                -- A 401/403/network timeout is not an instruction to retry
+                -- 30+ times per second. Show its reason and continue the hop.
+                if os.clock() >= (reportRetryAt[uid] or 0) then
+                    apiPublishedUids[uid] = {
+                        JobId = currentJobId,
+                        ReservedAt = os.clock(),
+                        Name = tostring(entry.name or ""),
+                    }
+                    filterStatus.Text = "Finder-2 • " .. tostring(entry.name)
+                    filterStatus.TextColor3 = COLORS.Gray
+                    local ok = publishEntryToApi(runtimeState._cloneEntry(entry), threshold)
+                    if not ok then
+                        publishFailed = true
+                        apiPublishedUids[uid] = nil
+                        reportRetryAt[uid] = os.clock() + 6
+                        filterStatus.Text = "Finder-2 ERROR • " .. tostring(runtimeState._lastEggPublishError or "NETWORK"):sub(1, 72)
+                        filterStatus.TextColor3 = Color3.fromRGB(255, 92, 112)
+                    end
+                else
                     publishFailed = true
-                    apiPublishedUids[uid] = nil
-                    filterStatus.Text = "Voryken API send failed • retrying"
-                    filterStatus.TextColor3 = Color3.fromRGB(255, 92, 112)
-                    break
                 end
             end
         end
     end
 
-    if publishFailed then
-        return
-    end
-
     if matchingCount > 0 then
-        filterStatus.Text = "Voryken API sent • " .. tostring(matchingCount) .. " match" .. (matchingCount == 1 and "" or "es")
-        filterStatus.TextColor3 = COLORS.Green
+        if publishFailed then
+            filterStatus.Text = "Finder-2 report failed • moving on: "
+                .. tostring(runtimeState._lastEggPublishError or "retry pending"):sub(1, 60)
+            filterStatus.TextColor3 = Color3.fromRGB(255, 92, 112)
+            warn("[VORYKEN REPORT] Egg upload failed. Check Finder-2 Rules and /reports writes.")
+        else
+            filterStatus.Text = "Finder-2 sent • " .. tostring(matchingCount) .. " match" .. (matchingCount == 1 and "" or "es")
+            filterStatus.TextColor3 = COLORS.Green
+        end
     end
 
     if serverHopEnabled then
@@ -5372,7 +5393,8 @@ end
 
 function runtimeState._publishNormalUidImmediate(uid, slotObject)
     uid = tostring(uid or "")
-    if uid == "" or apiPublishedUids[uid] or CycleRuntime.hopBlocked() then
+    if uid == "" or apiPublishedUids[uid] or CycleRuntime.hopBlocked()
+        or os.clock() < (reportRetryAt[uid] or 0) then
         return false
     end
 
@@ -5403,10 +5425,13 @@ function runtimeState._publishNormalUidImmediate(uid, slotObject)
     local ok = publishEntryToApi(runtimeState._cloneEntry(entry), threshold)
     if not ok then
         apiPublishedUids[uid] = nil
+        reportRetryAt[uid] = os.clock() + 6
+        filterStatus.Text = "Finder-2 SEND ERROR • " .. tostring(runtimeState._lastEggPublishError or "NETWORK"):sub(1, 64)
+        filterStatus.TextColor3 = Color3.fromRGB(255, 92, 112)
         return false
     end
 
-    filterStatus.Text = "Voryken API sent • " .. tostring(entry.name)
+    filterStatus.Text = "Finder-2 sent • " .. tostring(entry.name)
     filterStatus.TextColor3 = COLORS.Green
     return true
 end
@@ -5457,6 +5482,7 @@ function runtimeState._publishHalloweenImmediate()
                 filterStatus.TextColor3 = COLORS.Green
             else
                 apiPublishedUids[uid] = nil
+                reportRetryAt[uid] = os.clock() + 6
             end
         end
     end
