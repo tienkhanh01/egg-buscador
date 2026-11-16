@@ -1,4 +1,4 @@
--- VORYKEN SCANNER • HOP OPTIMIZADO v3 • register new users reliably + timed hop nuevo 
+-- VORYKEN SCANNER • HOP OPTIMIZADO v3 • register new users reliably + timed hop
 
 -- Voryken Egg Finder • Voryken API-only bootstrap
 -- Caches this exact build so Server Hop never falls back to an older remote loader.
@@ -2708,21 +2708,18 @@ end
 -- Every egg that enters the automatic Discord queue is also
 -- published immediately to Voryken API, without waiting for Discord.
 --==============================================================
--- Firebase authentication: each Roblox client owns a different anonymous UID.
--- Firebase WEB API keys identify the Firebase project; they are not secrets.
--- Paste them from Firebase Console > Project settings > General > Web API Key.
+-- VORYKEN Firebase directo: NINGUNA WEB API KEY ni Firebase Auth.
+-- Cola publica (servidorespyton); los reportes 100M+ admiten escritura
+-- pero no lectura publica (finder-2), segun Rules del proyecto.
 local VORYKEN_API_ROOT = "https://servidorespyton-default-rtdb.firebaseio.com"
 local VORYKEN_EGGS_API_ROOT = "https://finder-2-d8407-default-rtdb.firebaseio.com"
-local FIREBASE_QUEUE_WEB_API_KEY = "PON_AQUI_WEB_API_KEY_SERVIDORESPYTON"
-local FIREBASE_EGGS_WEB_API_KEY = "PON_AQUI_WEB_API_KEY_FINDER_2"
 
 local function firebaseHttp(method, url, value, headers)
     local requestFn = getRequester()
     if type(requestFn) ~= "function" then return false, nil, 0, "EXECUTOR_HTTP_UNAVAILABLE" end
     local args = {
-        Url = url, Method = tostring(method or "GET"),
-        Headers = headers or { ["Accept"] = "application/json" },
-        Timeout = 10,
+        Url = url, Method = tostring(method or "GET"), Timeout = 8,
+        Headers = headers or { ["Accept"] = "application/json" }
     }
     if value ~= nil then
         args.Body = type(value) == "string" and value or HttpService:JSONEncode(value)
@@ -2741,102 +2738,14 @@ local function firebaseHttp(method, url, value, headers)
     return true, data, code, nil
 end
 
-local function newFirebaseClient(dbUrl, webKey, fileTag)
-    local client = { db = dbUrl, key = webKey,
-        file = "VorykenEggFinder/firebase_auth_" .. fileTag .. "_" .. tostring(player.UserId) .. ".json",
-        uid = nil, token = nil, refresh = nil, expiresAt = 0, busy = false, lastError = nil }
-
-    local function saveCredentials()
-        if type(fileWrite) == "function" and client.uid and client.refresh then
-            ensureFinderFolder()
-            pcall(fileWrite, client.file, HttpService:JSONEncode({uid=client.uid, refresh=client.refresh}))
-        end
-    end
-    local function loadCredentials()
-        if type(fileRead) == "function" then
-            local ok, raw = pcall(fileRead, client.file)
-            if ok and type(raw) == "string" then
-                local decodedOk, credentials = pcall(function() return HttpService:JSONDecode(raw) end)
-                if decodedOk and type(credentials) == "table" then
-                    client.uid = tostring(credentials.uid or "")
-                    client.refresh = tostring(credentials.refresh or "")
-                end
-            end
-        end
-    end
-    loadCredentials()
-    function client.ensureAuth()
-        if client.token and os.time() < client.expiresAt then return true end
-        if client.busy then
-            local untilAt = os.clock() + 8
-            repeat task.wait(0.08) until not client.busy or os.clock() > untilAt
-            return client.token ~= nil and os.time() < client.expiresAt
-        end
-        if client.key:find("PON_AQUI", 1, true) then
-            client.lastError = "FALTA_WEB_API_KEY_" .. fileTag
-            return false
-        end
-        client.busy = true
-        local ok, data, status, reason = false, nil, 0, nil
-        if client.refresh and client.refresh ~= "" then
-            local refreshUrl = "https://securetoken.googleapis.com/v1/token?key=" .. client.key
-            local body = "grant_type=refresh_token&refresh_token=" .. client.refresh
-            ok, data, status, reason = firebaseHttp("POST", refreshUrl, body, {
-                ["Content-Type"] = "application/x-www-form-urlencoded"
-            })
-            if ok and type(data) == "table" then
-                client.uid = tostring(data.user_id or client.uid or "")
-                client.token = tostring(data.id_token or "")
-                client.refresh = tostring(data.refresh_token or client.refresh or "")
-                client.expiresAt = os.time() + math.max(60, (tonumber(data.expires_in) or 3600) - 120)
-            else
-                client.refresh = nil
-            end
-        end
-        if not client.token or client.token == "" then
-            local url = "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=" .. client.key
-            ok, data, status, reason = firebaseHttp("POST", url, {returnSecureToken=true})
-            if ok and type(data) == "table" then
-                client.uid = tostring(data.localId or "")
-                client.token = tostring(data.idToken or "")
-                client.refresh = tostring(data.refreshToken or "")
-                client.expiresAt = os.time() + math.max(60, (tonumber(data.expiresIn) or 3600) - 120)
-            end
-        end
-        if client.token == "" then client.token = nil end
-        if client.uid == "" then client.uid = nil end
-        local success = client.uid ~= nil and client.token ~= nil
-        if success then
-            client.lastError = nil
-            saveCredentials()
-        else
-            client.lastError = tostring(reason or "FIREBASE_AUTH_FAILED")
-        end
-        client.busy = false
-        return success
-    end
-    function client.request(method, path, value)
-        if not client.ensureAuth() then return false, nil, 0, client.lastError end
-        local cleanPath = tostring(path or ""):gsub("^/+", ""):gsub("%.json$", "")
-        if cleanPath == "" then return false, nil, 0, "ROOT_ACCESS_FORBIDDEN" end
-        local url = client.db .. "/" .. cleanPath .. ".json?auth=" .. client.token
-        local ok, data, status, reason = firebaseHttp(method, url, value)
-        if not ok and (status == 401 or status == 403) then
-            client.token = nil
-            if client.ensureAuth() then
-                url = client.db .. "/" .. cleanPath .. ".json?auth=" .. client.token
-                ok, data, status, reason = firebaseHttp(method, url, value)
-            end
-        end
-        client.lastError = ok and nil or reason
-        return ok, data, status, reason
-    end
-    return client
-end
-
-local FirebaseQueue = newFirebaseClient(VORYKEN_API_ROOT, FIREBASE_QUEUE_WEB_API_KEY, "queue")
-local FirebaseEggs = newFirebaseClient(VORYKEN_EGGS_API_ROOT, FIREBASE_EGGS_WEB_API_KEY, "eggs")
-
+local FirebaseQueue = {
+    uid = tostring(player.UserId or 0), lastError=nil,
+    ensureAuth=function() return true end
+}
+local FirebaseEggs = {
+    uid = tostring(player.UserId or 0), lastError=nil,
+    ensureAuth=function() return true end
+}
 local VorykenStore = {}
 function VorykenStore.safe(value)
     return tostring(value or ""):gsub("[^%w_%-]", "_")
@@ -2844,13 +2753,16 @@ end
 function VorykenStore.request(method, url, value, extraHeaders)
     local input = tostring(url or "")
     local isEggs = input:sub(1, #VORYKEN_EGGS_API_ROOT) == VORYKEN_EGGS_API_ROOT
-    local client = isEggs and FirebaseEggs or FirebaseQueue
     local root = isEggs and VORYKEN_EGGS_API_ROOT or VORYKEN_API_ROOT
-    local path = input:sub(#root + 1)
-    local ok, result, status, reason = client.request(method, path, value)
-    return ok, result, status, reason, nil
+    if input:sub(1,#root) ~= root then
+        return false,nil,400,"INVALID_FIREBASE_HOST",nil
+    end
+    if isEggs and tostring(method):upper() ~= "PUT" then
+        return false,nil,403,"REPORTS_WRITE_ONLY",nil
+    end
+    local ok, result, status, reason = firebaseHttp(method,input,value,extraHeaders)
+    return ok,result,status,reason,nil
 end
-
 
 --==============================================================
 -- API CLOCK + 5 MINUTE CYCLE GUARD
