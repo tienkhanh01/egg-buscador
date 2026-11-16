@@ -3914,6 +3914,10 @@ local serverHopQueuedAfterSend = false
 local lastServerHopAttempt = 0
 local serverHopRetryQueued = false
 local serverHopCurrentTarget = nil
+local serverHopCurrentClaimId = nil
+local serverHopTeleportAttempts = 0
+local serverHopTeleportStarted = false
+local serverHopAttemptHandled = 0
 
 local hopClock = {
     id = 0,
@@ -4034,7 +4038,7 @@ local sending = false
 -- API DYNAMIC USER SLOT + SERVER CLAIM
 -- Every Roblox account registers itself in /finder/users/<UserId>.
 -- Python assigns slots 1..N based on the registered users and publishes one
--- server at /finder/servers/<slot>. Lua deletes its exact slot BEFORE teleport.
+-- server at /finder/servers/<slot>. Lua sends a pending intent; Python marks USED only after destination JobId heartbeat.
 --==============================================================
 runtimeState.ApiQueue = runtimeState.ApiQueue or {}
 runtimeState.ApiQueue.userKey = nil
@@ -4356,19 +4360,25 @@ function runtimeState._requestServerClaimFromPython()
     if not target then return nil, targetError or "SLOT_WAITING" end
     local id = tostring(target.id or "")
     if id == "" or id == tostring(game.JobId or "") then return nil, "INVALID_TARGET" end
-    hopMeasureStage("firebase claim")
-    -- One private write. Python's Firebase listener consumes the claim and
-    -- replaces this account's assignment; do not wait for Python to acknowledge.
+    if failedHopTargetsThisServer[id] then
+        return nil, "FAILED_TARGET_WAIT_REFILL"
+    end
+    hopMeasureStage("firebase intent")
+    -- One private write. Python keeps the reservation until the destination scanner confirms arrival.
+    -- A failed teleport is NOT a consumed server.
     local claim = {
         jobId = id,
         slot = tonumber(target.slot) or 0,
         claimedAt = CycleRuntime.localUnixMs(),
         claimId = HttpService:GenerateGUID(false),
         userId = tostring(player.UserId or 0),
+        originJobId = tostring(game.JobId or ""),
+        state = "pending",
     }
     local ok, _response, _status, reason = runtimeState.ApiQueue.rawRequest(
         "PUT", VORYKEN_API_ROOT .. "/finder/claims/" .. tostring(FirebaseQueue.uid) .. ".json", claim)
     if not ok then return nil, reason or "CLAIM_WRITE_FAILED" end
+    serverHopCurrentClaimId = claim.claimId
     return target, nil
 end
 
@@ -4406,16 +4416,42 @@ function runtimeState._queueServerHopRetry(reason, delaySeconds)
         return
     end
 
-    if serverHopCurrentTarget then
-        failedHopTargetsThisServer[tostring(serverHopCurrentTarget)] = true
+    local failedJob = serverHopCurrentTarget and tostring(serverHopCurrentTarget) or nil
+    local failedClaim = serverHopCurrentClaimId
+    if failedJob then
+        failedHopTargetsThisServer[failedJob] = true
     end
-
     serverHopBusy = false
     serverHopCurrentTarget = nil
+    serverHopCurrentClaimId = nil
+    serverHopTeleportAttempts = 0
+    serverHopTeleportStarted = false
     hopMeasureStop("failed / retrying")
 
     local reasonText = tostring(reason or "ERROR")
-    filterStatus.Text = "Server Hop failed • " .. reasonText .. " • requesting Voryken API refill"
+    filterStatus.Text = "Teleport failed • " .. reasonText .. " • requesting new JobId"
+    -- Do not mark USED on failure. Notify Python, which releases the slot and
+    -- picks another server. The local rejection map avoids retrying the old id.
+    if failedJob and failedClaim then
+        task.spawn(function()
+            local claimUrl = VORYKEN_API_ROOT .. "/finder/claims/" .. tostring(FirebaseQueue.uid) .. ".json"
+            for attempt = 1, 4 do
+                if tostring(game.JobId or "") == failedJob then return end
+                local ok, fresh = runtimeState.ApiQueue.rawRequest("GET", claimUrl)
+                if ok and type(fresh) == "table" and tostring(fresh.claimId or "") == failedClaim then
+                    local wrote = runtimeState.ApiQueue.rawRequest("PATCH", claimUrl, {
+                        state = "failed",
+                        failureReason = reasonText,
+                        failedAt = CycleRuntime.localUnixMs(),
+                    })
+                    if wrote then return end
+                elseif ok then
+                    return -- Already consumed/replaced by Python; never overwrite it.
+                end
+                task.wait(0.6)
+            end
+        end)
+    end
     filterStatus.TextColor3 = Color3.fromRGB(255, 181, 82)
 
     if serverHopRetryQueued then
@@ -4515,6 +4551,89 @@ function runtimeState._waitForAllCurrentServerEggs(originJobId)
     return false, "SERVER_CHANGED"
 end
 
+
+-- Keep a pending claim reserved through transient Roblox failures. A second
+-- attempt uses the SAME destination; only the final failure releases the slot.
+local attemptTeleportCurrent
+local handleTeleportFailure
+handleTeleportFailure = function(reason, fatal, delaySeconds)
+    if not serverHopBusy or not serverHopCurrentTarget then return end
+    local attempt = serverHopTeleportAttempts
+    if serverHopAttemptHandled == attempt then return end
+    serverHopAttemptHandled = attempt
+    local originJob = tostring(game.JobId or "")
+    local target = tostring(serverHopCurrentTarget)
+    if not fatal and attempt < 2 then
+        local retryDelay = tonumber(delaySeconds) or 1.0
+        filterStatus.Text = "Roblox teleport retry " .. tostring(attempt + 1)
+            .. "/2 • " .. tostring(reason or "NO_TRANSITION")
+        warn("[VORYKEN HOP] Retrying same target " .. target .. " after " .. tostring(reason))
+        task.delay(retryDelay, function()
+            if serverHopBusy and serverHopCurrentTarget == target
+                and tostring(game.JobId or "") == originJob then
+                attemptTeleportCurrent(originJob)
+            end
+        end)
+    else
+        runtimeState._queueServerHopRetry(reason or "TELEPORT_FAILED", 1.25)
+    end
+end
+
+attemptTeleportCurrent = function(originJob)
+    if not serverHopBusy or not serverHopCurrentTarget then return end
+    if tostring(game.JobId or "") ~= tostring(originJob) then return end
+    local target = tostring(serverHopCurrentTarget)
+    serverHopTeleportAttempts += 1
+    serverHopTeleportStarted = false
+    local attempt = serverHopTeleportAttempts
+    filterStatus.Text = "Teleport " .. tostring(attempt) .. "/2 • " .. target:sub(1, 11)
+    hopMeasureStage("Roblox teleport attempt " .. tostring(attempt))
+
+    local ok, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, target, player)
+    end)
+    if not ok then
+        warn("[VORYKEN HOP] Roblox rejected teleport: " .. tostring(err))
+        handleTeleportFailure("CALL_ERROR " .. tostring(err):sub(1, 65), false, 1.0)
+        return
+    end
+
+    -- pcall success means the request was STARTED, not that Roblox joined.
+    -- The destination scanner heartbeat is what confirms the join in Python.
+    hopMeasureStage("waiting for Roblox transfer")
+    task.delay(12, function()
+        if not serverHopBusy or serverHopCurrentTarget ~= target
+            or serverHopTeleportAttempts ~= attempt
+            or tostring(game.JobId or "") ~= tostring(originJob) then return end
+        if serverHopTeleportStarted then
+            -- The engine reported a loading/teleport state; allow extra time.
+            task.delay(20, function()
+                if serverHopBusy and serverHopCurrentTarget == target
+                    and serverHopTeleportAttempts == attempt
+                    and tostring(game.JobId or "") == tostring(originJob) then
+                    handleTeleportFailure("ROBX_TRANSFER_STUCK", false, 1.0)
+                end
+            end)
+        else
+            handleTeleportFailure("NO_TRANSFER_12S", false, 1.0)
+        end
+    end)
+end
+
+pcall(function()
+    player.OnTeleport:Connect(function(state)
+        if not serverHopBusy or not serverHopCurrentTarget then return end
+        if state == Enum.TeleportState.Started
+            or state == Enum.TeleportState.WaitingForServer
+            or state == Enum.TeleportState.InProgress then
+            serverHopTeleportStarted = true
+            hopMeasureStage("Roblox transfer started")
+        elseif state == Enum.TeleportState.Failed then
+            handleTeleportFailure("ROBLOX_TRANSFER_FAILED", false, 1.0)
+        end
+    end)
+end)
+
 runtimeState._performServerHop = function(reason)
     if not serverHopEnabled or serverHopBusy then
         return false
@@ -4542,6 +4661,10 @@ runtimeState._performServerHop = function(reason)
 
     lastServerHopAttempt = now
     serverHopBusy = true
+    serverHopCurrentClaimId = nil
+    serverHopTeleportAttempts = 0
+    serverHopAttemptHandled = 0
+    serverHopTeleportStarted = false
     hopMeasureStart(reason)
 
     filterStatus.Text = "Server Hop • reading current eggs"
@@ -4656,7 +4779,8 @@ runtimeState._performServerHop = function(reason)
             if reasonText == "SLOT_WAITING"
                 or reasonText == "SLOT_CHANGED"
                 or reasonText == "SLOT_REASSIGNED"
-                or reasonText == "NO_USER_SLOT" then
+                or reasonText == "NO_USER_SLOT"
+                or reasonText == "FAILED_TARGET_WAIT_REFILL" then
                 filterStatus.Text = currentInstanceSlot > 0
                     and ("Slot #" .. tostring(currentInstanceSlot) .. " • waiting Voryken API refill")
                     or "Registering user • waiting automatic slot"
@@ -4686,10 +4810,8 @@ runtimeState._performServerHop = function(reason)
         hopMeasureStage("queueing teleport")
 
         if failedHopTargetsThisServer[serverId] then
-            -- Python already consumed this slot. Do not use it again locally.
-            serverHopBusy = false
-            serverHopCurrentTarget = nil
-            runtimeState._queueServerHopRetry("LOCAL_DUPLICATE", 0.5)
+            serverHopCurrentTarget = serverId
+            runtimeState._queueServerHopRetry("LOCAL_DUPLICATE", 1.0)
             return
         end
 
@@ -4704,11 +4826,8 @@ runtimeState._performServerHop = function(reason)
         filterStatus.TextColor3 = COLORS.Green
 
         if CycleRuntime.hopBlocked() then
-            serverHopBusy = false
-            serverHopCurrentTarget = nil
+            runtimeState._queueServerHopRetry("CYCLE_GUARD_AFTER_CLAIM", 2.0)
             refreshRequested = true
-            filterStatus.Text = "Cycle reset • teleport paused"
-            filterStatus.TextColor3 = Color3.fromRGB(255, 181, 82)
             return
         end
 
@@ -4718,35 +4837,9 @@ runtimeState._performServerHop = function(reason)
             filterStatus.TextColor3 = Color3.fromRGB(255, 181, 82)
         end
 
-        local okTeleport, teleportError = pcall(function()
-            TeleportService:TeleportToPlaceInstance(
-                game.PlaceId,
-                serverId,
-                player
-            )
-        end)
-
-        if okTeleport then
-            hopMeasureStage("Roblox teleport pending")
-        else
-            warn("[VORYKEN HOP] TeleportToPlaceInstance error: " .. tostring(teleportError))
-        end
-
-        if not okTeleport then
-            runtimeState._queueServerHopRetry("CALL_ERROR", 1.0)
-            return
-        end
-
-        task.delay(8, function()
-            if serverHopEnabled
-                and serverHopBusy
-                and serverHopCurrentTarget == serverId
-                and tostring(game.JobId) == originJobId
-                and screen.Parent then
-
-                runtimeState._queueServerHopRetry("TIMEOUT", 1.0)
-            end
-        end)
+        -- Do not consume Firebase assignment before the destination server
+        -- is confirmed. Retry one transient Roblox failure before releasing.
+        attemptTeleportCurrent(originJobId)
     end)
 
     return true
@@ -4772,7 +4865,12 @@ TeleportService.TeleportInitFailed:Connect(function(failedPlayer, teleportResult
         end
     end
 
-    runtimeState._queueServerHopRetry(reason, reason == "Flooded" and 2.0 or 1.0)
+    local fatal = reason == "SERVER_FULL"
+        or reason == "GameFull"
+        or reason == "GameNotFound"
+        or reason == "Unauthorized"
+        or reason == "GameEnded"
+    handleTeleportFailure(reason, fatal, reason == "Flooded" and 8.0 or 1.0)
 end)
 
 function runtimeState._cloneEntry(entry)
