@@ -1,5 +1,4 @@
--- VORYKEN SCANNER • HOP OPTIMIZADO v3 • register new users reliably + timed hop
-
+-- VORYKEN SCANNER • HOP OPTIMIZADO v3 • register new users reliably + timed hop nuevo 
 
 -- Voryken Egg Finder • Voryken API-only bootstrap
 -- Caches this exact build so Server Hop never falls back to an older remote loader.
@@ -604,7 +603,6 @@ local function queueFinderForNextServer()
     -- available; fall back to the existing hosted loader otherwise.
     -- The 3-second delay happens before either implementation starts.
     local queuedCode = [[
-task.wait(3)
 local started = false
 pcall(function()
     local env = (type(getgenv) == "function" and getgenv()) or _G
@@ -2710,219 +2708,147 @@ end
 -- Every egg that enters the automatic Discord queue is also
 -- published immediately to Voryken API, without waiting for Discord.
 --==============================================================
-local VORYKEN_API_ROOT = "https://codes.voryken.com/api/data/servidores.json"
-local VORYKEN_EGGS_API_ROOT = "https://codes.voryken.com/api/data/eggs_servers.json"
-local VORYKEN_EGGS_API_KEY = "vkd_MXoIQhrqFLF3jQ94Nowmaf-dJjjsWifGml3Cvo4UkLMT_tAH"
--- ATTENTION: This credential is visible in every distributed client-side Lua.
--- Rotate/restrict the project key if you publish the scanner publicly.
-local VORYKEN_API_KEY = "vkd_xAYXqrXbNhuD6jbDgqKUxlhGKNbdB3Tky3sF_TMmS4ISn7tn"
+-- Firebase authentication: each Roblox client owns a different anonymous UID.
+-- Firebase WEB API keys identify the Firebase project; they are not secrets.
+-- Paste them from Firebase Console > Project settings > General > Web API Key.
+local VORYKEN_API_ROOT = "https://servidorespyton-default-rtdb.firebaseio.com"
+local VORYKEN_EGGS_API_ROOT = "https://finder-2-d8407-default-rtdb.firebaseio.com"
+local FIREBASE_QUEUE_WEB_API_KEY = "PON_AQUI_WEB_API_KEY_SERVIDORESPYTON"
+local FIREBASE_EGGS_WEB_API_KEY = "PON_AQUI_WEB_API_KEY_FINDER_2"
 
--- GET and PATCH are the methods confirmed by the owner's example.
--- All writes address ONE top-level record to avoid overwriting other users.
--- The collector Python uses exactly these same flat keys.
-local VorykenStore = {
-    cache = nil,
-    cacheAt = -math.huge,
-    eggsCache = nil,
-    eggsCacheAt = -math.huge,
-    cacheSeconds = 0.30,
-}
-
-function VorykenStore.safe(value)
-    return tostring(value or ""):gsub("[^%w_%-]", function(character)
-        return "_" .. string.format("%X", string.byte(character)) .. "_"
-    end)
-end
-
-function VorykenStore.parts(url)
-    local path = tostring(url or "")
-    if path:sub(1, #VORYKEN_EGGS_API_ROOT) == VORYKEN_EGGS_API_ROOT then
-        path = path:sub(#VORYKEN_EGGS_API_ROOT + 1)
-    elseif path:sub(1, #VORYKEN_API_ROOT) == VORYKEN_API_ROOT then
-        path = path:sub(#VORYKEN_API_ROOT + 1)
-    end
-    path = path:gsub("%?.*$", ""):gsub("%.json$", "")
-    local parts = {}
-    for part in path:gmatch("[^/]+") do
-        parts[#parts + 1] = part
-    end
-    return parts
-end
-
-function VorykenStore.key(parts)
-    if parts[1] == "finder" and parts[2] == "users" and parts[3] then
-        return "voryken_user__" .. VorykenStore.safe(parts[3])
-    elseif parts[1] == "finder" and parts[2] == "servers" and parts[3] then
-        return "voryken_slot__" .. VorykenStore.safe(parts[3])
-    elseif parts[1] == "finder" and parts[2] == "used" and parts[3] then
-        return "voryken_used__" .. VorykenStore.safe(parts[3])
-    elseif parts[1] == "eggs" and parts[2] and parts[3] then
-        return "voryken_egg__" .. VorykenStore.safe(parts[2]) .. "__" .. VorykenStore.safe(parts[3])
-    end
-    return nil
-end
-
-function VorykenStore.http(method, rawBody, dataKind)
-    local requester = getRequester()
-    if type(requester) ~= "function" then
-        return false, nil, nil, "HTTP_REQUEST_UNAVAILABLE", nil
-    end
-    local requestData = {
-        Url = dataKind == "eggs" and VORYKEN_EGGS_API_ROOT or VORYKEN_API_ROOT,
-        Method = tostring(method or "GET"),
-        Headers = {
-            ["X-API-Key"] = dataKind == "eggs" and VORYKEN_EGGS_API_KEY or VORYKEN_API_KEY,
-            ["Content-Type"] = "application/json",
-            ["Accept"] = "application/json",
-            ["Cache-Control"] = "no-cache",
-        },
+local function firebaseHttp(method, url, value, headers)
+    local requestFn = getRequester()
+    if type(requestFn) ~= "function" then return false, nil, 0, "EXECUTOR_HTTP_UNAVAILABLE" end
+    local args = {
+        Url = url, Method = tostring(method or "GET"),
+        Headers = headers or { ["Accept"] = "application/json" },
+        Timeout = 10,
     }
-    if rawBody ~= nil then
-        requestData.Body = type(rawBody) == "string" and rawBody or HttpService:JSONEncode(rawBody)
+    if value ~= nil then
+        args.Body = type(value) == "string" and value or HttpService:JSONEncode(value)
+        args.Headers["Content-Type"] = args.Headers["Content-Type"] or "application/json"
     end
-    local ok, response = pcall(function() return requester(requestData) end)
-    if not ok then return false, nil, nil, tostring(response), nil end
-
-    local status = type(response) == "table" and tonumber(
-        response.StatusCode or response.Status or response.status or response.status_code
-    ) or nil
-    local body = type(response) == "table" and (
-        response.Body or response.body or response.ResponseBody or response.responseBody
-    ) or (type(response) == "string" and response or nil)
-    local headers = type(response) == "table" and (response.Headers or response.headers) or nil
-    local textBody = type(body) == "string" and body or ""
-    local isAccessPage = textBody:find("/cdn-cgi/access/login", 1, true)
-        or textBody:lower():find("<!doctype html", 1, true)
-        or textBody:lower():find("<html", 1, true)
-    if isAccessPage then
-        return false, nil, status, "CLOUDFLARE_ACCESS_BLOCKED", headers
+    local ok, result = pcall(requestFn, args)
+    if not ok then return false, nil, 0, tostring(result) end
+    local code = type(result) == "table" and tonumber(result.StatusCode or result.Status or result.status) or 200
+    local raw = type(result) == "table" and (result.Body or result.body or result.ResponseBody) or result
+    if code and (code < 200 or code >= 300) then
+        return false, nil, code, "FIREBASE_HTTP_" .. tostring(code) .. " " .. tostring(raw or ""):sub(1, 110)
     end
-    if status and (status < 200 or status >= 300) then
-        return false, nil, status, "HTTP_" .. tostring(status), headers
-    end
-    if method == "GET" then
-        local decodeOK, decoded = pcall(function() return HttpService:JSONDecode(textBody) end)
-        if not decodeOK or type(decoded) ~= "table" then
-            return false, nil, status, "INVALID_API_JSON", headers
-        end
-        return true, decoded, status or 200, nil, headers
-    end
-    return true, nil, status or 200, nil, headers
+    if type(raw) ~= "string" or raw == "" or raw == "null" then return true, nil, code, nil end
+    local parsedOk, data = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not parsedOk then return false, nil, code, "FIREBASE_INVALID_JSON" end
+    return true, data, code, nil
 end
 
-function VorykenStore.readAll(force, dataKind)
-    local isEggs = dataKind == "eggs"
-    local cached = isEggs and VorykenStore.eggsCache or VorykenStore.cache
-    local cachedAt = isEggs and VorykenStore.eggsCacheAt or VorykenStore.cacheAt
-    if not force and type(cached) == "table"
-        and os.clock() - cachedAt < VorykenStore.cacheSeconds then
-        return true, cached, nil
-    end
-    local ok, data, _status, reason = VorykenStore.http("GET", nil, dataKind)
-    if not ok then return false, nil, reason end
-    if isEggs then
-        VorykenStore.eggsCache = data
-        VorykenStore.eggsCacheAt = os.clock()
-    else
-        VorykenStore.cache = data
-        VorykenStore.cacheAt = os.clock()
-    end
-    return true, data, nil
-end
+local function newFirebaseClient(dbUrl, webKey, fileTag)
+    local client = { db = dbUrl, key = webKey,
+        file = "VorykenEggFinder/firebase_auth_" .. fileTag .. "_" .. tostring(player.UserId) .. ".json",
+        uid = nil, token = nil, refresh = nil, expiresAt = 0, busy = false, lastError = nil }
 
-function VorykenStore.lookup(doc, parts)
-    local key = VorykenStore.key(parts)
-    if key then return doc[key] end
-    local prefix = nil
-    if parts[1] == "finder" then
-        if parts[2] == "users" then prefix = "voryken_user__" end
-        if parts[2] == "servers" then prefix = "voryken_slot__" end
-        if parts[2] == "used" then prefix = "voryken_used__" end
-    end
-    if prefix then
-        local out = {}
-        for name, record in pairs(doc) do
-            if type(name) == "string" and name:sub(1, #prefix) == prefix and type(record) == "table" then
-                out[name:sub(#prefix + 1)] = record
-            end
+    local function saveCredentials()
+        if type(fileWrite) == "function" and client.uid and client.refresh then
+            ensureFinderFolder()
+            pcall(fileWrite, client.file, HttpService:JSONEncode({uid=client.uid, refresh=client.refresh}))
         end
-        return out
     end
-    if parts[1] == "eggs" then
-        local result = {}
-        for name, record in pairs(doc) do
-            if type(name) == "string" and name:sub(1, 13) == "voryken_egg__"
-                and type(record) == "table" then
-                local jobId = tostring(record.jobId or "")
-                local uid = tostring(record.uid or "")
-                if jobId ~= "" and uid ~= "" then
-                    result[jobId] = result[jobId] or {}
-                    result[jobId][uid] = record
+    local function loadCredentials()
+        if type(fileRead) == "function" then
+            local ok, raw = pcall(fileRead, client.file)
+            if ok and type(raw) == "string" then
+                local decodedOk, credentials = pcall(function() return HttpService:JSONDecode(raw) end)
+                if decodedOk and type(credentials) == "table" then
+                    client.uid = tostring(credentials.uid or "")
+                    client.refresh = tostring(credentials.refresh or "")
                 end
             end
         end
-        return parts[2] and result[parts[2]] or result
     end
-    return doc
+    loadCredentials()
+    function client.ensureAuth()
+        if client.token and os.time() < client.expiresAt then return true end
+        if client.busy then
+            local untilAt = os.clock() + 8
+            repeat task.wait(0.08) until not client.busy or os.clock() > untilAt
+            return client.token ~= nil and os.time() < client.expiresAt
+        end
+        if client.key:find("PON_AQUI", 1, true) then
+            client.lastError = "FALTA_WEB_API_KEY_" .. fileTag
+            return false
+        end
+        client.busy = true
+        local ok, data, status, reason = false, nil, 0, nil
+        if client.refresh and client.refresh ~= "" then
+            local refreshUrl = "https://securetoken.googleapis.com/v1/token?key=" .. client.key
+            local body = "grant_type=refresh_token&refresh_token=" .. client.refresh
+            ok, data, status, reason = firebaseHttp("POST", refreshUrl, body, {
+                ["Content-Type"] = "application/x-www-form-urlencoded"
+            })
+            if ok and type(data) == "table" then
+                client.uid = tostring(data.user_id or client.uid or "")
+                client.token = tostring(data.id_token or "")
+                client.refresh = tostring(data.refresh_token or client.refresh or "")
+                client.expiresAt = os.time() + math.max(60, (tonumber(data.expires_in) or 3600) - 120)
+            else
+                client.refresh = nil
+            end
+        end
+        if not client.token or client.token == "" then
+            local url = "https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=" .. client.key
+            ok, data, status, reason = firebaseHttp("POST", url, {returnSecureToken=true})
+            if ok and type(data) == "table" then
+                client.uid = tostring(data.localId or "")
+                client.token = tostring(data.idToken or "")
+                client.refresh = tostring(data.refreshToken or "")
+                client.expiresAt = os.time() + math.max(60, (tonumber(data.expiresIn) or 3600) - 120)
+            end
+        end
+        if client.token == "" then client.token = nil end
+        if client.uid == "" then client.uid = nil end
+        local success = client.uid ~= nil and client.token ~= nil
+        if success then
+            client.lastError = nil
+            saveCredentials()
+        else
+            client.lastError = tostring(reason or "FIREBASE_AUTH_FAILED")
+        end
+        client.busy = false
+        return success
+    end
+    function client.request(method, path, value)
+        if not client.ensureAuth() then return false, nil, 0, client.lastError end
+        local cleanPath = tostring(path or ""):gsub("^/+", ""):gsub("%.json$", "")
+        if cleanPath == "" then return false, nil, 0, "ROOT_ACCESS_FORBIDDEN" end
+        local url = client.db .. "/" .. cleanPath .. ".json?auth=" .. client.token
+        local ok, data, status, reason = firebaseHttp(method, url, value)
+        if not ok and (status == 401 or status == 403) then
+            client.token = nil
+            if client.ensureAuth() then
+                url = client.db .. "/" .. cleanPath .. ".json?auth=" .. client.token
+                ok, data, status, reason = firebaseHttp(method, url, value)
+            end
+        end
+        client.lastError = ok and nil or reason
+        return ok, data, status, reason
+    end
+    return client
 end
 
+local FirebaseQueue = newFirebaseClient(VORYKEN_API_ROOT, FIREBASE_QUEUE_WEB_API_KEY, "queue")
+local FirebaseEggs = newFirebaseClient(VORYKEN_EGGS_API_ROOT, FIREBASE_EGGS_WEB_API_KEY, "eggs")
+
+local VorykenStore = {}
+function VorykenStore.safe(value)
+    return tostring(value or ""):gsub("[^%w_%-]", "_")
+end
 function VorykenStore.request(method, url, value, extraHeaders)
-    method = tostring(method or "GET"):upper()
-    local parts = VorykenStore.parts(url)
-    local dataKind = tostring(url or ""):sub(1, #VORYKEN_EGGS_API_ROOT) == VORYKEN_EGGS_API_ROOT
-        and "eggs" or "queue"
-    local key = VorykenStore.key(parts)
-    if method == "GET" then
-        local force = type(extraHeaders) == "table" and extraHeaders["X-Force-Read"] ~= nil
-        local ok, doc, reason = VorykenStore.readAll(force, dataKind)
-        if not ok then return false, nil, nil, reason, nil end
-        return true, VorykenStore.lookup(doc, parts), 200, nil, nil
-    end
-    if not key then return false, nil, nil, "UNSUPPORTED_DATA_PATH", nil end
-    local writeBody = nil
-    if method == "DELETE" then
-        -- JSON 'null' is encoded manually because Luau tables cannot hold nil keys.
-        writeBody = "{" .. HttpService:JSONEncode(key) .. ":null}"
-    elseif method == "PUT" or method == "PATCH" then
-        local payload = value
-        if type(payload) == "string" then
-            local decodeOK, decoded = pcall(function() return HttpService:JSONDecode(payload) end)
-            if not decodeOK then return false, nil, nil, "INVALID_PAYLOAD", nil end
-            payload = decoded
-        end
-        if type(payload) ~= "table" then return false, nil, nil, "INVALID_PAYLOAD", nil end
-        if method == "PATCH" then
-            local ok, doc, reason = VorykenStore.readAll(true, dataKind)
-            if not ok then return false, nil, nil, reason, nil end
-            local merged = {}
-            if type(doc[key]) == "table" then
-                for k, v in pairs(doc[key]) do merged[k] = v end
-            end
-            for k, v in pairs(payload) do merged[k] = v end
-            payload = merged
-        end
-        writeBody = HttpService:JSONEncode({ [key] = payload })
-    else
-        return false, nil, nil, "UNSUPPORTED_API_METHOD", nil
-    end
-    local ok, data, status, reason, headers = VorykenStore.http("PATCH", writeBody, dataKind)
-    if ok then
-        local cache = dataKind == "eggs" and VorykenStore.eggsCache or VorykenStore.cache
-        if type(cache) == "table" then
-            if method == "DELETE" then
-                cache[key] = nil
-            else
-                local decodedOK, decoded = pcall(function() return HttpService:JSONDecode(writeBody) end)
-                if decodedOK and type(decoded) == "table" then cache[key] = decoded[key] end
-            end
-        end
-        if dataKind == "eggs" then
-            VorykenStore.eggsCacheAt = -math.huge
-        else
-            VorykenStore.cacheAt = -math.huge
-        end
-    end
-    return ok, data, status, reason, headers
+    local input = tostring(url or "")
+    local isEggs = input:sub(1, #VORYKEN_EGGS_API_ROOT) == VORYKEN_EGGS_API_ROOT
+    local client = isEggs and FirebaseEggs or FirebaseQueue
+    local root = isEggs and VORYKEN_EGGS_API_ROOT or VORYKEN_API_ROOT
+    local path = input:sub(#root + 1)
+    local ok, result, status, reason = client.request(method, path, value)
+    return ok, result, status, reason, nil
 end
 
 
@@ -3126,8 +3052,12 @@ local function publishEntryToApi(entry, threshold)
         schemaVersion = 2,
     }
 
+    if not FirebaseEggs.ensureAuth() then
+        return false, FirebaseEggs.lastError or "FINDER_AUTH_ERROR"
+    end
     local url = VORYKEN_EGGS_API_ROOT
-        .. "/eggs/" .. apiSafeKey(jobId)
+        .. "/reports/" .. tostring(FirebaseEggs.uid)
+        .. "/" .. apiSafeKey(jobId)
         .. "/" .. apiSafeKey(uid)
         .. ".json"
 
@@ -3995,7 +3925,7 @@ local filterStatus = make("TextLabel", {
     Position = UDim2.fromOffset(14, 404),
     Size = UDim2.fromOffset(274, 16),
     BackgroundTransparency = 1,
-    Text = "Voryken API filter off • enter an amount",
+    Text = "Firebase filter off • enter an amount",
     TextColor3 = COLORS.Gray,
     TextSize = 11,
     Font = Enum.Font.GothamMedium,
@@ -4129,11 +4059,11 @@ end
 local function refreshFilterStatus()
     local threshold = getAutoThreshold()
     if not threshold then
-        filterStatus.Text = "Voryken API filter off • enter an amount"
+        filterStatus.Text = "Firebase filter off • enter an amount"
         filterStatus.TextColor3 = COLORS.Gray
         return
     end
-    filterStatus.Text = "Voryken API ON • " .. formatNumber(threshold) .. "+"
+    filterStatus.Text = "Firebase ON • " .. formatNumber(threshold) .. "+"
     if serverHopEnabled then
         filterStatus.Text = filterStatus.Text .. " • HOP ON"
     end
@@ -4195,8 +4125,8 @@ local sending = false
 -- server at /finder/servers/<slot>. Lua deletes its exact slot BEFORE teleport.
 --==============================================================
 runtimeState.ApiQueue = runtimeState.ApiQueue or {}
-runtimeState.ApiQueue.userKey = tostring(player.UserId or 0):gsub("[%.#$%[%]/]", "_")
-runtimeState.ApiQueue.userUrl = VORYKEN_API_ROOT .. "/finder/users/" .. runtimeState.ApiQueue.userKey .. ".json"
+runtimeState.ApiQueue.userKey = nil
+runtimeState.ApiQueue.userUrl = nil
 runtimeState.ApiQueue.lastHeartbeat = 0
 runtimeState.ApiQueue.sessionStartedAt = CycleRuntime.localUnixMs()
 runtimeState.ApiQueue.registeredOnce = false
@@ -4254,6 +4184,13 @@ end
 
 function runtimeState.ApiQueue.registerOrHeartbeat(force)
     local queue = runtimeState.ApiQueue
+    if not FirebaseQueue.ensureAuth() then
+        queue.lastError = FirebaseQueue.lastError or "FIREBASE_AUTH"
+        showPendingSlot("AUTH ERR", Color3.fromRGB(255, 181, 82))
+        return false, nil
+    end
+    queue.userKey = FirebaseQueue.uid
+    queue.userUrl = VORYKEN_API_ROOT .. "/finder/users/" .. queue.userKey .. ".json"
     if queue.expired then
         queue.lastError = "STOCK_EXPIRED_RESTART_SCANNER"
         showPendingSlot("EXPIRED", Color3.fromRGB(255, 181, 82))
@@ -4298,10 +4235,9 @@ function runtimeState.ApiQueue.registerOrHeartbeat(force)
                     return false, nil
                 end
                 if type(confirmed) ~= "table" then
-                    queue.expired = true
-                    queue.lastError = "STOCK_EXPIRED_RESTART_SCANNER"
+                    queue.registeredOnce = false
                     queue.applySlot(0)
-                    showPendingSlot("EXPIRED", Color3.fromRGB(255, 181, 82))
+                    showPendingSlot("RE-REG", Color3.fromRGB(255, 181, 82))
                     return false, nil
                 end
                 existing = confirmed
@@ -4440,7 +4376,7 @@ function runtimeState._readMyPublishedServerSlot()
 
     local ok, server = runtimeState.ApiQueue.rawRequest(
         "GET",
-        VORYKEN_API_ROOT .. "/finder/servers/" .. tostring(slot) .. ".json"
+        VORYKEN_API_ROOT .. "/finder/assignments/" .. tostring(FirebaseQueue.uid) .. ".json"
     )
     if not ok or type(server) ~= "table" then
         return nil, "SLOT_WAITING"
@@ -4504,146 +4440,31 @@ function runtimeState._waitForMyPublishedServerSlot()
 end
 
 function runtimeState._requestServerClaimFromPython()
-    -- Poll the assigned queue slot first; this does not re-register the user.
     local target, targetError = runtimeState._waitForMyPublishedServerSlot()
-    if not target then
-        return nil, targetError or "SLOT_WAITING"
-    end
-    hopMeasureStage("verifying claimed slot")
-
-    local slot = tonumber(target.slot) or currentInstanceSlot
-    local slotUrl = VORYKEN_API_ROOT .. "/finder/servers/" .. tostring(slot) .. ".json"
-    -- Force ONE fresh snapshot to verify the assigned user and job ID.
-    local okGet, doc, reason = VorykenStore.readAll(true, "queue")
-    if not okGet or type(doc) ~= "table" then
-        return nil, reason or "SLOT_WAITING"
-    end
-
-    local slotKey = VorykenStore.key(VorykenStore.parts(slotUrl))
-    local server = doc[slotKey]
-    if type(server) ~= "table" then return nil, "SLOT_CHANGED" end
-
-    local id = tostring(server.jobId or server.id or "")
-    if id == "" then return nil, "SLOT_WAITING" end
-    if id == tostring(game.JobId or "") then return nil, "CLAIM_RETURNED_CURRENT" end
-
-    local assignedUserId = tostring(server.assignedUserId or "")
-    if assignedUserId ~= "" and assignedUserId ~= tostring(player.UserId or 0) then
-        return nil, "SLOT_REASSIGNED"
-    end
-
-    hopMeasureStage("saving claim")
-    -- The flat JSON API supports a PATCH with multiple top-level keys.
-    -- Mark used and remove the slot in ONE request.  This is necessary to
-    -- avoid the old PUT -> DELETE -> user PATCH multi-request chain.
-    -- Preserve the full user record so no slot/account fields are discarded.
-    local usedKey = "voryken_used__" .. VorykenStore.safe(id)
-    local nowMs = CycleRuntime.localUnixMs()
-    local changes = {
-        [usedKey] = {
-            usedAt = nowMs,
-            userId = tostring(player.UserId or 0),
-            username = tostring(player.Name or ""),
-            slot = slot,
-        },
+    if not target then return nil, targetError or "SLOT_WAITING" end
+    local id = tostring(target.id or "")
+    if id == "" or id == tostring(game.JobId or "") then return nil, "INVALID_TARGET" end
+    hopMeasureStage("firebase claim")
+    -- One private write. Python's Firebase listener consumes the claim and
+    -- replaces this account's assignment; do not wait for Python to acknowledge.
+    local claim = {
+        jobId = id,
+        slot = tonumber(target.slot) or 0,
+        claimedAt = CycleRuntime.localUnixMs(),
+        claimId = HttpService:GenerateGUID(false),
+        userId = tostring(player.UserId or 0),
     }
-    local userKey = "voryken_user__" .. runtimeState.ApiQueue.userKey
-    local userRecord = doc[userKey]
-    if type(userRecord) == "table" then
-        local updatedUser = {}
-        for key, value in pairs(userRecord) do updatedUser[key] = value end
-        updatedUser.lastClaimedJobId = id
-        updatedUser.lastClaimedAt = nowMs
-        updatedUser.lastSeen = nowMs
-        changes[userKey] = updatedUser
-    end
-    -- Roblox JSONEncode cannot store nil, so append the null slot directly.
-    local payload = HttpService:JSONEncode(changes)
-    payload = payload:sub(1, -2) .. "," .. HttpService:JSONEncode(slotKey) .. ":null}"
-
-    local okClaim, _data, _status, claimError = VorykenStore.http("PATCH", payload, "queue")
-    if not okClaim then
-        return nil, claimError or "CLAIM_PATCH_FAILED"
-    end
-
-    -- Force a fresh queue snapshot after teleport, never reuse consumed slots.
-    VorykenStore.cacheAt = -math.huge
-    VorykenStore.cache = nil
-
-    return {
-        id = id,
-        slot = slot,
-        playing = tonumber(server.playing) or 0,
-        maxPlayers = tonumber(server.maxPlayers) or 0,
-        ping = tonumber(server.ping),
-        fps = tonumber(server.fps),
-    }, nil
+    local ok, _response, _status, reason = runtimeState.ApiQueue.rawRequest(
+        "PUT", VORYKEN_API_ROOT .. "/finder/claims/" .. tostring(FirebaseQueue.uid) .. ".json", claim)
+    if not ok then return nil, reason or "CLAIM_WRITE_FAILED" end
+    return target, nil
 end
 
 -- One bounded stale-stock cleanup when ANY client starts. Heartbeats do not
 -- count as claims. Python performs the same cleanup centrally every 30s.
 -- Only queue records are touched, NEVER eggs_servers.json.
 function runtimeState.ApiQueue.cleanupStaleUserStocks()
-    local ok, doc = VorykenStore.readAll(true, "queue")
-    if not ok or type(doc) ~= "table" then return 0 end
-    local nowMs = CycleRuntime.localUnixMs()
-    local outdated = {}
-    for key, record in pairs(doc) do
-        if type(key) == "string" and key:sub(1, 14) == "voryken_user__"
-            and type(record) == "table" then
-            local userId = tostring(record.userId or "")
-            if userId ~= tostring(player.UserId or 0) then
-                local lastClaim = tonumber(record.lastClaimedAt) or 0
-                local sessionStart = tonumber(record.sessionStartedAt) or 0
-                local registered = tonumber(record.registeredAt) or 0
-                local baseline = math.max(lastClaim, sessionStart, registered)
-                if baseline > 0 and baseline < 100000000000 then baseline *= 1000 end
-                if baseline > 0 and nowMs - baseline > 600000 then
-                    outdated[#outdated + 1] = {key = key, userId = userId}
-                    if #outdated >= 20 then break end
-                end
-            end
-        end
-    end
-    if #outdated == 0 then return 0 end
-
-    -- Re-read to avoid deleting a stock just claimed in the meantime.
-    local okFresh, fresh = VorykenStore.readAll(true, "queue")
-    if not okFresh or type(fresh) ~= "table" then return 0 end
-    local changes = {}
-    local removed = 0
-    for _, item in ipairs(outdated) do
-        local record = fresh[item.key]
-        if type(record) == "table" then
-            local lastClaim = tonumber(record.lastClaimedAt) or 0
-            local sessionStart = tonumber(record.sessionStartedAt) or 0
-            local registered = tonumber(record.registeredAt) or 0
-            local baseline = math.max(lastClaim, sessionStart, registered)
-            if baseline > 0 and baseline < 100000000000 then baseline *= 1000 end
-            if baseline > 0 and nowMs - baseline > 600000 then
-                changes[item.key] = true
-                removed += 1
-                local slot = math.floor(tonumber(record.slot) or 0)
-                local slotKey = "voryken_slot__" .. tostring(slot)
-                local stock = fresh[slotKey]
-                if slot > 0 and type(stock) == "table"
-                    and tostring(stock.assignedUserId or "") == item.userId then
-                    changes[slotKey] = true
-                end
-            end
-        end
-    end
-    if removed == 0 then return 0 end
-    local pieces = {}
-    for key in pairs(changes) do
-        pieces[#pieces + 1] = HttpService:JSONEncode(key) .. ":null"
-    end
-    local payload = "{" .. table.concat(pieces, ",") .. "}"
-    local wrote = VorykenStore.http("PATCH", payload, "queue")
-    if wrote then
-        VorykenStore.cacheAt = -math.huge
-        return removed
-    end
+    -- Clients cannot list other users; only Python Admin SDK prunes old accounts.
     return 0
 end
 
