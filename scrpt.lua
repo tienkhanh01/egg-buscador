@@ -1,4 +1,4 @@
--- VORYKEN SCANNER • FIREBASE FIX v4 • bounded HTTP + teleport retries + diagnostics
+-- VORYKEN SCANNER • FINDER-2 DIRECT v5 • no token / verified publishing
 
 -- Voryken Egg Finder • Voryken API-only bootstrap
 -- Caches this exact build so Server Hop never falls back to an older remote loader.
@@ -2708,43 +2708,63 @@ end
 -- Every egg that enters the automatic Discord queue is also
 -- published immediately to Voryken API, without waiting for Discord.
 --==============================================================
--- VORYKEN Firebase directo: NINGUNA WEB API KEY ni Firebase Auth.
--- Cola publica (servidorespyton); los reportes 100M+ admiten escritura
--- pero no lectura publica (finder-2), segun Rules del proyecto.
+-- Firebase directo sin token ni Web API Key.
+-- /reports es de LECTURA PUBLICA en Rules v5. Esto NO protege la lista.
+-- El registro PUT del huevo solo cuenta como enviado cuando Firebase lo confirma.
 local VORYKEN_API_ROOT = "https://servidorespyton-default-rtdb.firebaseio.com"
 local VORYKEN_EGGS_API_ROOT = "https://finder-2-d8407-default-rtdb.firebaseio.com"
 
 local function firebaseHttp(method, url, value, headers)
+    -- API sin autenticacion. En ejecutores que no exponen request,
+    -- probamos RequestAsync; si esta bloqueado se mostrara el error real.
     local requestFn = getRequester()
-    if type(requestFn) ~= "function" then return false, nil, 0, "EXECUTOR_HTTP_UNAVAILABLE" end
-    local args = {
-        Url = url, Method = tostring(method or "GET"), Timeout = 6,
+    if type(requestFn) ~= "function" then
+        requestFn = function(opts) return HttpService:RequestAsync(opts) end
+    end
+    local options = {
+        Url = tostring(url), Method = tostring(method or "GET"):upper(),
+        Timeout = 5,
         Headers = headers or { ["Accept"] = "application/json" }
     }
     if value ~= nil then
-        args.Body = type(value) == "string" and value or HttpService:JSONEncode(value)
-        args.Headers["Content-Type"] = args.Headers["Content-Type"] or "application/json"
+        options.Body = type(value) == "string" and value or HttpService:JSONEncode(value)
+        options.Headers["Content-Type"] = "application/json"
     end
-    -- Some executors ignore request.Timeout. Bound our wait independently so
-    -- a stuck HTTP call never freezes scanning or delays a Roblox teleport.
-    local finished, ok, result = false, false, nil
+    local done, success, response = false, false, nil
     task.spawn(function()
-        ok, result = pcall(requestFn, args)
-        finished = true
+        success, response = pcall(requestFn, options)
+        done = true
     end)
-    local deadline = os.clock() + 7
-    while not finished and os.clock() < deadline do task.wait(0.05) end
-    if not finished then return false, nil, 0, "FIREBASE_CLIENT_TIMEOUT_7S" end
-    if not ok then return false, nil, 0, tostring(result) end
-    local code = type(result) == "table" and tonumber(result.StatusCode or result.Status or result.status) or 200
-    local raw = type(result) == "table" and (result.Body or result.body or result.ResponseBody) or result
-    if code and (code < 200 or code >= 300) then
-        return false, nil, code, "FIREBASE_HTTP_" .. tostring(code) .. " " .. tostring(raw or ""):sub(1, 110)
+    local deadline = os.clock() + 5.5
+    while not done and os.clock() < deadline do task.wait(0.05) end
+    if not done then return false, nil, 0, "FINDER2_TIMEOUT_5_5S" end
+    if not success then return false, nil, 0, "FINDER2_REQUEST: " .. tostring(response):sub(1, 140) end
+
+    local status = nil
+    local raw = nil
+    if type(response) == "table" then
+        status = tonumber(response.StatusCode or response.Status or response.status or response.status_code)
+        raw = response.Body or response.body or response.ResponseBody or response.responseBody
+        if response.Success == false and (status == nil or status >= 400) then
+            return false, nil, status or 0, "FINDER2_FAILED: " .. tostring(raw or ""):sub(1, 120)
+        end
+    elseif type(response) == "string" then
+        raw = response
     end
-    if type(raw) ~= "string" or raw == "" or raw == "null" then return true, nil, code, nil end
-    local parsedOk, data = pcall(function() return HttpService:JSONDecode(raw) end)
-    if not parsedOk then return false, nil, code, "FIREBASE_INVALID_JSON" end
-    return true, data, code, nil
+    if status and (status < 200 or status >= 300) then
+        return false, nil, status, "FINDER2_HTTP_" .. tostring(status) .. " " .. tostring(raw or ""):sub(1, 120)
+    end
+    if status == nil and type(raw) ~= "string" then
+        return false, nil, 0, "FINDER2_NO_HTTP_RESPONSE"
+    end
+    if type(raw) ~= "string" or raw == "" or raw == "null" then
+        return true, nil, status or 200, nil
+    end
+    local parsedOk, parsed = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not parsedOk then
+        return false, nil, status or 0, "FINDER2_INVALID_JSON: " .. raw:sub(1, 70)
+    end
+    return true, parsed, status or 200, nil
 end
 
 local FirebaseQueue = {
@@ -2984,14 +3004,38 @@ local function publishEntryToApi(entry, threshold)
 
     -- One request per attempt. Fast failure must not stall the hop forever.
     -- The caller decides whether to retry this UID on a later scan.
-    local ok, _data, status, reason = VorykenStore.request("PUT", url, payload)
+    local ok, returned, status, reason = VorykenStore.request("PUT", url, payload)
     if ok then
-        runtimeState._lastEggPublishError = nil
-        return true, status
+        local confirmed = type(returned) == "table"
+            and tostring(returned.uid or "") == uid
+            and tostring(returned.jobId or "") == jobId
+            and tonumber(returned.value) == tonumber(payload.value)
+        -- Some executors return an empty body after a successful PUT.
+        -- Check the exact same record before reporting success.
+        if not confirmed then
+            local readOK, saved, readStatus, readReason = firebaseHttp("GET", url)
+            confirmed = readOK and type(saved) == "table"
+                and tostring(saved.uid or "") == uid
+                and tostring(saved.jobId or "") == jobId
+                and tonumber(saved.value) == tonumber(payload.value)
+            if not confirmed then
+                reason = "WRITE_NOT_VERIFIED_" .. tostring(readStatus or "0")
+                    .. "_" .. tostring(readReason or "NO_RECORD")
+            end
+        end
+        if confirmed then
+            runtimeState._lastEggPublishError = nil
+            runtimeState._lastEggPublishedJob = jobId
+            runtimeState._lastEggPublishedUid = uid
+            runtimeState._lastEggPublishedAt = os.clock()
+            print("[VORYKEN FINDER-2] CONFIRMED 100M+ " .. tostring(entry.name or "")
+                .. " | JobId=" .. jobId .. " | UID=" .. uid)
+            return true, status
+        end
     end
     local detail = tostring(reason or ("HTTP_" .. tostring(status or "NO_STATUS")))
     runtimeState._lastEggPublishError = detail
-    warn("[VORYKEN REPORT] Finder-2 PUT failed: " .. detail:sub(1, 180))
+    warn("[VORYKEN FINDER-2] PUT FAILED: " .. detail:sub(1, 190))
     return false, detail
 
 end
