@@ -1,5 +1,5 @@
--- VORYKEN SCANNER • HOP OPTIMIZADO v2 • API claim batched + timing diagnostics
-task.wait(3)
+-- VORYKEN SCANNER • HOP OPTIMIZADO v3 • register new users reliably + timed hop
+
 
 -- Voryken Egg Finder • Voryken API-only bootstrap
 -- Caches this exact build so Server Hop never falls back to an older remote loader.
@@ -4240,57 +4240,118 @@ function runtimeState.ApiQueue.applySlot(slot)
     return slot
 end
 
+-- Registering and polling a new account may happen at the same time.
+-- Keep exactly ONE writer per Roblox client to prevent its own requests from
+-- racing, and retry registration if the first attempt fails.
+runtimeState.ApiQueue.registerBusy = false
+
+local function showPendingSlot(label, color)
+    if currentInstanceSlot <= 0 and slotBox.Parent then
+        slotBox.Text = label
+        slotBox.TextColor3 = color or COLORS.White
+    end
+end
+
 function runtimeState.ApiQueue.registerOrHeartbeat(force)
-    if runtimeState.ApiQueue.expired then
-        runtimeState.ApiQueue.lastError = "STOCK_EXPIRED_RESTART_SCANNER"
+    local queue = runtimeState.ApiQueue
+    if queue.expired then
+        queue.lastError = "STOCK_EXPIRED_RESTART_SCANNER"
+        showPendingSlot("EXPIRED", Color3.fromRGB(255, 181, 82))
         return false, nil
     end
-    local nowClock = os.clock()
-    if not force and nowClock - (runtimeState.ApiQueue.lastHeartbeat or 0) < 8 then
+    if not isCurrentVorykenRun() or not screen.Parent then
+        return false, nil
+    end
+    if queue.registerBusy then
         return currentInstanceSlot > 0, currentInstanceSlot
     end
-    runtimeState.ApiQueue.lastHeartbeat = nowClock
 
-    local okGet, existing = runtimeState.ApiQueue.rawRequest(
-        "GET",
-        runtimeState.ApiQueue.userUrl
-    )
-
-    if not okGet then
-        return false, nil
+    local nowClock = os.clock()
+    local interval = queue.registeredOnce and 8 or 1.5
+    if (not force or not queue.registeredOnce)
+        and nowClock - (queue.lastHeartbeat or -math.huge) < interval then
+        return currentInstanceSlot > 0, currentInstanceSlot
     end
-    if type(existing) ~= "table" then
-        -- A stock removed after this scanner registered must not be recreated
-        -- by its heartbeat. A NEW execution starts a new session and may register.
-        if runtimeState.ApiQueue.registeredOnce then
-            runtimeState.ApiQueue.expired = true
-            runtimeState.ApiQueue.lastError = "STOCK_EXPIRED_RESTART_SCANNER"
-            runtimeState.ApiQueue.applySlot(0)
+    queue.lastHeartbeat = nowClock
+    queue.registerBusy = true
+    local createdThisCall = false
+
+    local completed, resultOk, resultSlot = pcall(function()
+        -- Read the current user before writing: an existing record has a Python
+        -- assigned slot which must NOT be overwritten by a new stock payload.
+        local freshHeader = { ["X-Force-Read"] = "true" }
+        local okGet, existing = queue.rawRequest("GET", queue.userUrl, nil,
+            queue.registeredOnce and nil or freshHeader)
+        if not okGet then
+            showPendingSlot("API ERR", Color3.fromRGB(255, 181, 82))
             return false, nil
         end
-        local payload = {
-            userId = tostring(player.UserId or 0),
-            username = tostring(player.Name or ""),
-            displayName = tostring(player.DisplayName or player.Name or ""),
-            placeId = tonumber(game.PlaceId) or 0,
-            currentJobId = tostring(game.JobId or ""),
-            registeredAt = CycleRuntime.localUnixMs(),
-            sessionStartedAt = runtimeState.ApiQueue.sessionStartedAt,
-            lastSeen = CycleRuntime.localUnixMs(),
-            source = "Voryken Finder",
-        }
-        local wrote = runtimeState.ApiQueue.rawRequest("PUT", runtimeState.ApiQueue.userUrl, payload)
-        if wrote then runtimeState.ApiQueue.registeredOnce = true end
-    else
-        runtimeState.ApiQueue.registeredOnce = true
-        runtimeState.ApiQueue.applySlot(existing.slot)
-        runtimeState.ApiQueue.rawRequest(
-            "PATCH",
-            runtimeState.ApiQueue.userUrl,
-            {
+
+        if type(existing) ~= "table" then
+            if queue.registeredOnce then
+                -- Do not silently recreate an intentionally removed stock.
+                -- Confirm with an uncached read before treating it as expired.
+                local okConfirm, confirmed = queue.rawRequest(
+                    "GET", queue.userUrl, nil, freshHeader)
+                if not okConfirm then
+                    showPendingSlot("API ERR", Color3.fromRGB(255, 181, 82))
+                    return false, nil
+                end
+                if type(confirmed) ~= "table" then
+                    queue.expired = true
+                    queue.lastError = "STOCK_EXPIRED_RESTART_SCANNER"
+                    queue.applySlot(0)
+                    showPendingSlot("EXPIRED", Color3.fromRGB(255, 181, 82))
+                    return false, nil
+                end
+                existing = confirmed
+            else
+                -- This is a genuinely new account: create it immediately.
+                showPendingSlot("REG...", COLORS.White)
+                local timestamp = CycleRuntime.localUnixMs()
+                local payload = {
+                    userId = tostring(player.UserId or 0),
+                    username = tostring(player.Name or ""),
+                    displayName = tostring(player.DisplayName or player.Name or ""),
+                    placeId = tonumber(game.PlaceId) or 0,
+                    currentJobId = tostring(game.JobId or ""),
+                    registeredAt = timestamp,
+                    sessionStartedAt = queue.sessionStartedAt,
+                    lastSeen = timestamp,
+                    source = "Voryken Finder",
+                }
+                local wrote = queue.rawRequest("PUT", queue.userUrl, payload)
+                if not wrote then
+                    showPendingSlot("REG ERR", Color3.fromRGB(255, 181, 82))
+                    return false, nil
+                end
+
+                -- Only mark registration as successful after the user is
+                -- actually visible in the API. Otherwise retry on next tick.
+                local checked, confirmed = queue.rawRequest(
+                    "GET", queue.userUrl, nil, freshHeader)
+                if not checked or type(confirmed) ~= "table" then
+                    showPendingSlot("CHECK...", Color3.fromRGB(255, 181, 82))
+                    return false, nil
+                end
+                existing = confirmed
+                createdThisCall = true
+            end
+        end
+
+        queue.registeredOnce = true
+        local slot = queue.applySlot(existing.slot)
+        if slot <= 0 then
+            -- The user IS registered. The remaining step belongs to Python.
+            showPendingSlot("WAIT PY", Color3.fromRGB(255, 181, 82))
+        end
+
+        -- A newly created stock already includes its initial heartbeat.
+        if not createdThisCall then
+            local updated = {
                 sessionStartedAt = math.max(
                     tonumber(existing.sessionStartedAt) or 0,
-                    tonumber(runtimeState.ApiQueue.sessionStartedAt) or 0
+                    tonumber(queue.sessionStartedAt) or 0
                 ),
                 username = tostring(player.Name or ""),
                 displayName = tostring(player.DisplayName or player.Name or ""),
@@ -4298,63 +4359,74 @@ function runtimeState.ApiQueue.registerOrHeartbeat(force)
                 currentJobId = tostring(game.JobId or ""),
                 lastSeen = CycleRuntime.localUnixMs(),
             }
-        )
-    end
+            -- A failed heartbeat does not erase a valid assigned slot.
+            queue.rawRequest("PATCH", queue.userUrl, updated)
+        end
+        return slot > 0, slot
+    end)
 
-    local okRefresh, refreshed = runtimeState.ApiQueue.rawRequest(
-        "GET",
-        runtimeState.ApiQueue.userUrl
-    )
-    if okRefresh and type(refreshed) == "table" then
-        runtimeState.ApiQueue.applySlot(refreshed.slot)
+    queue.registerBusy = false
+    if not completed then
+        queue.lastError = "REGISTRATION_EXCEPTION: " .. tostring(resultOk):sub(1, 115)
+        showPendingSlot("REG ERR", Color3.fromRGB(255, 181, 82))
+        warn("[Voryken] Registration error: " .. tostring(resultOk))
+        return false, nil
     end
-
-    return currentInstanceSlot > 0, currentInstanceSlot
+    return resultOk, resultSlot
 end
 
 function runtimeState.ApiQueue.waitForSlot()
-    -- The background heartbeat registers this user and keeps its record fresh.
-    -- Do not re-run GET + PATCH + GET every 0.2s while hopping.
-    if currentInstanceSlot > 0 and runtimeState.ApiQueue.registeredOnce then
+    local queue = runtimeState.ApiQueue
+    if currentInstanceSlot > 0 and queue.registeredOnce then
         return currentInstanceSlot, nil
     end
 
     local lastPoll = -math.huge
+    local lastRegistrationTry = -math.huge
     while serverHopEnabled and screen.Parent and isCurrentVorykenRun() do
-        if currentInstanceSlot > 0 and runtimeState.ApiQueue.registeredOnce then
+        if currentInstanceSlot > 0 and queue.registeredOnce then
             return currentInstanceSlot, nil
         end
-
-        if runtimeState.ApiQueue.expired then
+        if queue.expired then
             return nil, "STOCK_EXPIRED_RESTART_SCANNER"
         end
 
-        if os.clock() - lastPoll >= 0.75 then
-            lastPoll = os.clock()
-            -- One read, no unnecessary writes.  The normal heartbeat performs
-            -- registration on startup and once every ten seconds.
-            local ok, existing = runtimeState.ApiQueue.rawRequest(
-                "GET", runtimeState.ApiQueue.userUrl
-            )
-            if ok and type(existing) == "table" then
-                runtimeState.ApiQueue.registeredOnce = true
-                local slot = runtimeState.ApiQueue.applySlot(existing.slot)
-                if slot > 0 then return slot, nil end
-            elseif ok and type(existing) ~= "table" then
-                if runtimeState.ApiQueue.registeredOnce then
-                    runtimeState.ApiQueue.expired = true
-                    runtimeState.ApiQueue.applySlot(0)
-                    return nil, "STOCK_EXPIRED_RESTART_SCANNER"
+        if not queue.registeredOnce then
+            -- Essential regression fix: while waiting for a new slot, retry
+            -- REGISTERING, not just reading a user that has never been created.
+            if os.clock() - lastRegistrationTry >= 1.5 then
+                lastRegistrationTry = os.clock()
+                local ok, slot = queue.registerOrHeartbeat(true)
+                if ok and tonumber(slot) and slot > 0 then
+                    return slot, nil
                 end
-                -- Initial registration is handled by the worker; don't create
-                -- competing PUT/PATCH requests here.
+            end
+        elseif os.clock() - lastPoll >= 0.75 then
+            lastPoll = os.clock()
+            -- A registered user without a slot only needs one cached GET.
+            -- Python is responsible for filling that user record with its slot.
+            local ok, existing = queue.rawRequest("GET", queue.userUrl)
+            if ok and type(existing) == "table" then
+                local slot = queue.applySlot(existing.slot)
+                if slot > 0 then return slot, nil end
+                showPendingSlot("WAIT PY", Color3.fromRGB(255, 181, 82))
+            elseif ok then
+                -- An old stock can be deliberately removed by the server.
+                -- Let the normal heartbeat confirm it before expiring it.
+                queue.registerOrHeartbeat(true)
             end
         end
 
-        filterStatus.Text = runtimeState.ApiQueue.lastError
-            and ("Voryken API • " .. tostring(runtimeState.ApiQueue.lastError))
-            or "Waiting for Python to assign user slot"
-        filterStatus.TextColor3 = Color3.fromRGB(255, 181, 82)
+        if queue.lastError then
+            filterStatus.Text = "Voryken registration • " .. tostring(queue.lastError):sub(1, 92)
+            filterStatus.TextColor3 = Color3.fromRGB(255, 181, 82)
+        elseif not queue.registeredOnce then
+            filterStatus.Text = "Registering new Voryken user..."
+            filterStatus.TextColor3 = Color3.fromRGB(255, 181, 82)
+        else
+            filterStatus.Text = "User registered • waiting for Python slot"
+            filterStatus.TextColor3 = Color3.fromRGB(255, 181, 82)
+        end
         task.wait(0.15)
     end
     return nil, "SERVER_HOP_DISABLED"
@@ -4406,11 +4478,18 @@ function runtimeState._waitForMyPublishedServerSlot()
 
         if os.clock() - lastStatusUpdate >= 0.75 then
             lastStatusUpdate = os.clock()
-            filterStatus.Text = currentInstanceSlot > 0
-                and ("Slot #" .. tostring(currentInstanceSlot) .. " • Python "
-                    .. tostring(math.floor(os.clock() - waitStarted)) .. "s")
-                or ("Waiting Python slot "
-                    .. tostring(math.floor(os.clock() - waitStarted)) .. "s")
+            local elapsed = tostring(math.floor(os.clock() - waitStarted)) .. "s"
+            if runtimeState.ApiQueue.lastError then
+                filterStatus.Text = "Voryken API error • "
+                    .. tostring(runtimeState.ApiQueue.lastError):sub(1, 90)
+            elseif not runtimeState.ApiQueue.registeredOnce then
+                filterStatus.Text = "Registering new user • " .. elapsed
+            elseif currentInstanceSlot <= 0 then
+                filterStatus.Text = "Registered • waiting Python slot • " .. elapsed
+            else
+                filterStatus.Text = "Slot #" .. tostring(currentInstanceSlot)
+                    .. " • waiting server • " .. elapsed
+            end
             filterStatus.TextColor3 = Color3.fromRGB(255, 181, 82)
         end
 
@@ -4573,11 +4652,16 @@ end
 -- Register immediately, then keep a lightweight heartbeat so Python always
 -- knows this account still exists and which Roblox server it is currently in.
 task.spawn(function()
+    -- Keep trying if initial registration fails, even when the hop worker
+    -- never runs (e.g. the current server still has qualifying eggs).
     task.wait(0.2)
-    runtimeState.ApiQueue.registerOrHeartbeat(true)
-    while screen.Parent do
-        task.wait(10)
-        runtimeState.ApiQueue.registerOrHeartbeat(true)
+    while screen.Parent and isCurrentVorykenRun() do
+        local ok, err = pcall(runtimeState.ApiQueue.registerOrHeartbeat, true)
+        if not ok then
+            runtimeState.ApiQueue.lastError = "REGISTER_WORKER: " .. tostring(err):sub(1, 100)
+            warn("[Voryken] Registration worker: " .. tostring(err))
+        end
+        task.wait(runtimeState.ApiQueue.registeredOnce and 10 or 2)
     end
 end)
 
