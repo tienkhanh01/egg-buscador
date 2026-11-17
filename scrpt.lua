@@ -1,4 +1,4 @@
--- VORYKEN SCANNER • FINDER-2 DIRECT v5 • no token / verified publishing
+-- VORYKEN SCANNER • WEB API SERVIDORES v6 • PATCH per egg / Firebase hop
 
 -- Voryken Egg Finder • Voryken API-only bootstrap
 -- Caches this exact build so Server Hop never falls back to an older remote loader.
@@ -2704,15 +2704,15 @@ local function getRequester()
 end
 
 --==============================================================
--- API MIRROR • REALTIME EGG FEED
--- Every egg that enters the automatic Discord queue is also
--- published immediately to Voryken API, without waiting for Discord.
+-- EGG REPORTS -> VORYKEN WEBSITE JSON DATA API
+-- Python/Server Hop continues using the ORIGINAL Firebase below.
+-- Website PATCH writes exactly ONE independently named flat record per egg.
 --==============================================================
--- Firebase directo sin token ni Web API Key.
--- /reports es de LECTURA PUBLICA en Rules v5. Esto NO protege la lista.
--- El registro PUT del huevo solo cuenta como enviado cuando Firebase lo confirma.
-local VORYKEN_API_ROOT = "https://servidorespyton-default-rtdb.firebaseio.com"
-local VORYKEN_EGGS_API_ROOT = "https://finder-2-d8407-default-rtdb.firebaseio.com"
+local VORYKEN_API_ROOT = "https://servidorespyton-default-rtdb.firebaseio.com"  -- Python hop queue (unchanged)
+local VORYKEN_EGGS_API_URL = "https://codes.voryken.com/api/data/servidores.json"
+-- CLIENT-SIDE CREDENTIAL: accessible to anyone who can read this distributed Lua.
+-- Restrict this key to the minimum permissions possible and rotate if shared.
+local VORYKEN_EGGS_API_KEY = "vkd_xAYXqrXbNhuD6jbDgqKUxlhGKNbdB3Tky3sF_TMmS4ISn7tn"
 
 local function firebaseHttp(method, url, value, headers)
     -- API sin autenticacion. En ejecutores que no exponen request,
@@ -2737,8 +2737,8 @@ local function firebaseHttp(method, url, value, headers)
     end)
     local deadline = os.clock() + 5.5
     while not done and os.clock() < deadline do task.wait(0.05) end
-    if not done then return false, nil, 0, "FINDER2_TIMEOUT_5_5S" end
-    if not success then return false, nil, 0, "FINDER2_REQUEST: " .. tostring(response):sub(1, 140) end
+    if not done then return false, nil, 0, "FIREBASE_TIMEOUT_5_5S" end
+    if not success then return false, nil, 0, "FIREBASE_REQUEST: " .. tostring(response):sub(1, 140) end
 
     local status = nil
     local raw = nil
@@ -2746,23 +2746,23 @@ local function firebaseHttp(method, url, value, headers)
         status = tonumber(response.StatusCode or response.Status or response.status or response.status_code)
         raw = response.Body or response.body or response.ResponseBody or response.responseBody
         if response.Success == false and (status == nil or status >= 400) then
-            return false, nil, status or 0, "FINDER2_FAILED: " .. tostring(raw or ""):sub(1, 120)
+            return false, nil, status or 0, "FIREBASE_FAILED: " .. tostring(raw or ""):sub(1, 120)
         end
     elseif type(response) == "string" then
         raw = response
     end
     if status and (status < 200 or status >= 300) then
-        return false, nil, status, "FINDER2_HTTP_" .. tostring(status) .. " " .. tostring(raw or ""):sub(1, 120)
+        return false, nil, status, "FIREBASE_HTTP_" .. tostring(status) .. " " .. tostring(raw or ""):sub(1, 120)
     end
     if status == nil and type(raw) ~= "string" then
-        return false, nil, 0, "FINDER2_NO_HTTP_RESPONSE"
+        return false, nil, 0, "FIREBASE_NO_HTTP_RESPONSE"
     end
     if type(raw) ~= "string" or raw == "" or raw == "null" then
         return true, nil, status or 200, nil
     end
     local parsedOk, parsed = pcall(function() return HttpService:JSONDecode(raw) end)
     if not parsedOk then
-        return false, nil, status or 0, "FINDER2_INVALID_JSON: " .. raw:sub(1, 70)
+        return false, nil, status or 0, "FIREBASE_INVALID_JSON: " .. raw:sub(1, 70)
     end
     return true, parsed, status or 200, nil
 end
@@ -2771,26 +2771,84 @@ local FirebaseQueue = {
     uid = tostring(player.UserId or 0), lastError=nil,
     ensureAuth=function() return true end
 }
-local FirebaseEggs = {
-    uid = tostring(player.UserId or 0), lastError=nil,
-    ensureAuth=function() return true end
-}
 local VorykenStore = {}
 function VorykenStore.safe(value)
     return tostring(value or ""):gsub("[^%w_%-]", "_")
 end
 function VorykenStore.request(method, url, value, extraHeaders)
+    -- All queue reads/writes stay exclusively in the Python Firebase.
     local input = tostring(url or "")
-    local isEggs = input:sub(1, #VORYKEN_EGGS_API_ROOT) == VORYKEN_EGGS_API_ROOT
-    local root = isEggs and VORYKEN_EGGS_API_ROOT or VORYKEN_API_ROOT
-    if input:sub(1,#root) ~= root then
-        return false,nil,400,"INVALID_FIREBASE_HOST",nil
+    if input:sub(1, #VORYKEN_API_ROOT + 1) ~= VORYKEN_API_ROOT .. "/" then
+        return false, nil, 400, "INVALID_FIREBASE_QUEUE_URL", nil
     end
-    if isEggs and tostring(method):upper() ~= "PUT" then
-        return false,nil,403,"REPORTS_WRITE_ONLY",nil
+    local ok, result, status, reason = firebaseHttp(method, input, value, extraHeaders)
+    return ok, result, status, reason, nil
+end
+
+-- Website JSON endpoint accepts a single PATCH object with one top-level key.
+-- Do not PUT the entire file: that would erase Python's server records.
+local function writeEggToWebsite(recordKey, payload)
+    local requester = getRequester()
+    if type(requester) ~= "function" then
+        return false, nil, "HTTP_REQUEST_UNAVAILABLE"
     end
-    local ok, result, status, reason = firebaseHttp(method,input,value,extraHeaders)
-    return ok,result,status,reason,nil
+
+    local encodedOk, body = pcall(function()
+        return HttpService:JSONEncode({ [recordKey] = payload })
+    end)
+    if not encodedOk then
+        return false, nil, "JSON_ENCODE_ERROR"
+    end
+
+    local opts = {
+        Url = VORYKEN_EGGS_API_URL,
+        Method = "PATCH",
+        Timeout = 6,
+        Headers = {
+            ["X-API-Key"] = VORYKEN_EGGS_API_KEY,
+            ["Content-Type"] = "application/json",
+            ["Accept"] = "application/json",
+            ["Cache-Control"] = "no-cache",
+        },
+        Body = body,
+    }
+
+    -- Bound each attempt even when an executor request hangs.
+    local done, success, response = false, false, nil
+    task.spawn(function()
+        success, response = pcall(requester, opts)
+        done = true
+    end)
+    local deadline = os.clock() + 6.5
+    while not done and os.clock() < deadline do
+        task.wait(0.03)
+    end
+    if not done then
+        return false, nil, "WEB_API_TIMEOUT"
+    end
+    if not success then
+        return false, nil, "WEB_API_REQUEST_FAILED: " .. tostring(response):sub(1, 100)
+    end
+
+    local status = type(response) == "table" and tonumber(
+        response.StatusCode or response.Status or response.status or response.status_code
+    ) or nil
+    local raw = type(response) == "table" and (
+        response.Body or response.body or response.ResponseBody or response.responseBody
+    ) or (type(response) == "string" and response or "")
+    local rawText = tostring(raw or "")
+
+    if rawText:find("/cdn-cgi/access/login", 1, true)
+        or rawText:lower():find("<!doctype html", 1, true) then
+        return false, status, "CLOUDFLARE_ACCESS_BLOCKED"
+    end
+    if not status then
+        return false, nil, "WEB_API_NO_STATUS"
+    end
+    if status < 200 or status >= 300 then
+        return false, status, "WEB_API_HTTP_" .. tostring(status) .. ": " .. rawText:sub(1, 110)
+    end
+    return true, status, nil
 end
 
 --==============================================================
@@ -2951,10 +3009,8 @@ local function publishEntryToApi(entry, threshold)
     if CycleRuntime.hopBlocked() then
         return false, "CYCLE_GUARD"
     end
-
-    local requester = getRequester()
-    if type(requester) ~= "function" or type(entry) ~= "table" then
-        return false, "HTTP_REQUEST_UNAVAILABLE"
+    if type(entry) ~= "table" then
+        return false, "INVALID_EGG"
     end
 
     local uid = tostring(entry.uid or "")
@@ -2963,16 +3019,14 @@ local function publishEntryToApi(entry, threshold)
         return false, "MISSING_ID"
     end
 
-    -- Count other players only. The scanner's own account must not
-    -- inflate the player count published with each detected egg.
     local otherPlayerCount = 0
-    local scannerPlayer = Players.LocalPlayer
     for _, inServerPlayer in ipairs(Players:GetPlayers()) do
-        if inServerPlayer ~= scannerPlayer then
+        if inServerPlayer ~= Players.LocalPlayer then
             otherPlayerCount += 1
         end
     end
 
+    local nowMs = CycleRuntime.localUnixMs()
     local payload = {
         uid = uid,
         category = tostring(entry.category or ""),
@@ -2986,58 +3040,32 @@ local function publishEntryToApi(entry, threshold)
         threshold = tonumber(threshold) or 0,
         playerCount = otherPlayerCount,
         maxPlayers = tonumber(Players.MaxPlayers) or 0,
-        sentAt = CycleRuntime.localUnixMs(),
-        detectedAt = CycleRuntime.localUnixMs(),
-        updatedAt = CycleRuntime.localUnixMs(),
+        reporterId = tostring(player.UserId or 0),
+        sentAt = nowMs,
+        detectedAt = nowMs,
+        updatedAt = nowMs,
         source = "Voryken Egg Finder",
         schemaVersion = 2,
     }
 
-    if not FirebaseEggs.ensureAuth() then
-        return false, FirebaseEggs.lastError or "FINDER_AUTH_ERROR"
-    end
-    local url = VORYKEN_EGGS_API_ROOT
-        .. "/reports/" .. tostring(FirebaseEggs.uid)
-        .. "/" .. apiSafeKey(jobId)
-        .. "/" .. apiSafeKey(uid)
-        .. ".json"
-
-    -- One request per attempt. Fast failure must not stall the hop forever.
-    -- The caller decides whether to retry this UID on a later scan.
-    local ok, returned, status, reason = VorykenStore.request("PUT", url, payload)
+    -- Same flat per-egg naming used by previous Voryken JSON-API scanner.
+    -- An egg is separate from voryken_user__, voryken_slot__, and voryken_used__.
+    local recordKey = "voryken_egg__" .. apiSafeKey(jobId) .. "__" .. apiSafeKey(uid)
+    local ok, status, reason = writeEggToWebsite(recordKey, payload)
     if ok then
-        local confirmed = type(returned) == "table"
-            and tostring(returned.uid or "") == uid
-            and tostring(returned.jobId or "") == jobId
-            and tonumber(returned.value) == tonumber(payload.value)
-        -- Some executors return an empty body after a successful PUT.
-        -- Check the exact same record before reporting success.
-        if not confirmed then
-            local readOK, saved, readStatus, readReason = firebaseHttp("GET", url)
-            confirmed = readOK and type(saved) == "table"
-                and tostring(saved.uid or "") == uid
-                and tostring(saved.jobId or "") == jobId
-                and tonumber(saved.value) == tonumber(payload.value)
-            if not confirmed then
-                reason = "WRITE_NOT_VERIFIED_" .. tostring(readStatus or "0")
-                    .. "_" .. tostring(readReason or "NO_RECORD")
-            end
-        end
-        if confirmed then
-            runtimeState._lastEggPublishError = nil
-            runtimeState._lastEggPublishedJob = jobId
-            runtimeState._lastEggPublishedUid = uid
-            runtimeState._lastEggPublishedAt = os.clock()
-            print("[VORYKEN FINDER-2] CONFIRMED 100M+ " .. tostring(entry.name or "")
-                .. " | JobId=" .. jobId .. " | UID=" .. uid)
-            return true, status
-        end
+        runtimeState._lastEggPublishError = nil
+        runtimeState._lastEggPublishedJob = jobId
+        runtimeState._lastEggPublishedUid = uid
+        runtimeState._lastEggPublishedAt = os.clock()
+        print("[VORYKEN WEB API] SENT " .. tostring(entry.name or "")
+            .. " | JobId=" .. jobId .. " | UID=" .. uid)
+        return true, status
     end
-    local detail = tostring(reason or ("HTTP_" .. tostring(status or "NO_STATUS")))
-    runtimeState._lastEggPublishError = detail
-    warn("[VORYKEN FINDER-2] PUT FAILED: " .. detail:sub(1, 190))
-    return false, detail
 
+    local detail = tostring(reason or "WEB_API_ERROR")
+    runtimeState._lastEggPublishError = detail
+    warn("[VORYKEN WEB API] PATCH FAILED: " .. detail:sub(1, 190))
+    return false, detail
 end
 
 local thumbnailCache = {}
@@ -5231,14 +5259,14 @@ function runtimeState._processAutomaticNotifications(topEntries, allEntries)
                         ReservedAt = os.clock(),
                         Name = tostring(entry.name or ""),
                     }
-                    filterStatus.Text = "Finder-2 • " .. tostring(entry.name)
+                    filterStatus.Text = "Voryken Web • " .. tostring(entry.name)
                     filterStatus.TextColor3 = COLORS.Gray
                     local ok = publishEntryToApi(runtimeState._cloneEntry(entry), threshold)
                     if not ok then
                         publishFailed = true
                         apiPublishedUids[uid] = nil
                         reportRetryAt[uid] = os.clock() + 6
-                        filterStatus.Text = "Finder-2 ERROR • " .. tostring(runtimeState._lastEggPublishError or "NETWORK"):sub(1, 72)
+                        filterStatus.Text = "Voryken Web ERROR • " .. tostring(runtimeState._lastEggPublishError or "NETWORK"):sub(1, 72)
                         filterStatus.TextColor3 = Color3.fromRGB(255, 92, 112)
                     end
                 else
@@ -5250,12 +5278,12 @@ function runtimeState._processAutomaticNotifications(topEntries, allEntries)
 
     if matchingCount > 0 then
         if publishFailed then
-            filterStatus.Text = "Finder-2 report failed • moving on: "
+            filterStatus.Text = "Voryken Web report failed • moving on: "
                 .. tostring(runtimeState._lastEggPublishError or "retry pending"):sub(1, 60)
             filterStatus.TextColor3 = Color3.fromRGB(255, 92, 112)
-            warn("[VORYKEN REPORT] Egg upload failed. Check Finder-2 Rules and /reports writes.")
+            warn("[VORYKEN REPORT] Egg upload failed. Check Voryken website API key, PATCH permission, and JSON endpoint.")
         else
-            filterStatus.Text = "Finder-2 sent • " .. tostring(matchingCount) .. " match" .. (matchingCount == 1 and "" or "es")
+            filterStatus.Text = "Voryken Web sent • " .. tostring(matchingCount) .. " match" .. (matchingCount == 1 and "" or "es")
             filterStatus.TextColor3 = COLORS.Green
         end
     end
@@ -5470,12 +5498,12 @@ function runtimeState._publishNormalUidImmediate(uid, slotObject)
     if not ok then
         apiPublishedUids[uid] = nil
         reportRetryAt[uid] = os.clock() + 6
-        filterStatus.Text = "Finder-2 SEND ERROR • " .. tostring(runtimeState._lastEggPublishError or "NETWORK"):sub(1, 64)
+        filterStatus.Text = "Voryken Web SEND ERROR • " .. tostring(runtimeState._lastEggPublishError or "NETWORK"):sub(1, 64)
         filterStatus.TextColor3 = Color3.fromRGB(255, 92, 112)
         return false
     end
 
-    filterStatus.Text = "Finder-2 sent • " .. tostring(entry.name)
+    filterStatus.Text = "Voryken Web sent • " .. tostring(entry.name)
     filterStatus.TextColor3 = COLORS.Green
     return true
 end
