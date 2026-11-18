@@ -2708,7 +2708,8 @@ end
 -- Python/Server Hop continues using the ORIGINAL Firebase below.
 -- Website PATCH writes exactly ONE independently named flat record per egg.
 --==============================================================
-local VORYKEN_API_ROOT = "https://yyyyy-8e598-default-rtdb.europe-west1.firebasedatabase.app"  -- Python hop queue (unchanged)
+local VORYKEN_API_ROOT = "https://datos.voryken.com/db/prj_x5Z2Wb3c2O1JMZ0KJoI-ksOT8jE"
+local VORYKEN_QUEUE_API_KEY = "vk_XmqaNVDV4ok3j-VRCEEmBMHwmZvxsWSNXL_A9NXguhudxsQZ"
 local VORYKEN_EGGS_API_URL = "https://codes.voryken.com/api/data/servidores.json"
 -- CLIENT-SIDE CREDENTIAL: accessible to anyone who can read this distributed Lua.
 -- Restrict this key to the minimum permissions possible and rotate if shared.
@@ -2726,6 +2727,8 @@ local function firebaseHttp(method, url, value, headers)
         Timeout = 5,
         Headers = headers or { ["Accept"] = "application/json" }
     }
+    -- Siempre enviar la clave de proyecto, incluso con cabeceras especiales.
+    options.Headers["X-API-Key"] = VORYKEN_QUEUE_API_KEY
     if value ~= nil then
         options.Body = type(value) == "string" and value or HttpService:JSONEncode(value)
         options.Headers["Content-Type"] = "application/json"
