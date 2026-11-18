@@ -1,4 +1,4 @@
--- VORYKEN SCANNER • WEB API SERVIDORES v6 • PATCH per egg / Firebase hop
+-- VORYKEN SCANNER • NUEVO DATOS HUEVOS / DATOS SEPARADO PARA SERVER HOP
 
 -- Voryken Egg Finder • Voryken API-only bootstrap
 -- Caches this exact build so Server Hop never falls back to an older remote loader.
@@ -2704,16 +2704,16 @@ local function getRequester()
 end
 
 --==============================================================
--- EGG REPORTS -> VORYKEN WEBSITE JSON DATA API
--- Python/Server Hop continues using the ORIGINAL Firebase below.
--- Website PATCH writes exactly ONE independently named flat record per egg.
+-- EGG REPORTS -> NEW VORYKEN DATOS PROJECT (separate from server queue)
+-- Python/Server Hop keeps using its existing, separate datos.voryken.com project.
+-- Egg PATCH writes ONE independently named flat record per egg.
 --==============================================================
 local VORYKEN_API_ROOT = "https://datos.voryken.com/db/prj_x5Z2Wb3c2O1JMZ0KJoI-ksOT8jE"
 local VORYKEN_QUEUE_API_KEY = "vk_XmqaNVDV4ok3j-VRCEEmBMHwmZvxsWSNXL_A9NXguhudxsQZ"
-local VORYKEN_EGGS_API_URL = "https://codes.voryken.com/api/data/servidores.json"
+local VORYKEN_EGGS_API_URL = "https://datos.voryken.com/db/prj_QzKlNDkC6cLJ1B7Uex7YyBzuPPQ.json"
 -- CLIENT-SIDE CREDENTIAL: accessible to anyone who can read this distributed Lua.
 -- Restrict this key to the minimum permissions possible and rotate if shared.
-local VORYKEN_EGGS_API_KEY = "vkd_xAYXqrXbNhuD6jbDgqKUxlhGKNbdB3Tky3sF_TMmS4ISn7tn"
+local VORYKEN_EGGS_API_KEY = "vk_A3P1bLRZOe1UaYxZgou1bzvO6JTyN1CvT93Z0r980pwOM3d9"
 
 local function firebaseHttp(method, url, value, headers)
     -- API sin autenticacion. En ejecutores que no exponen request,
@@ -2788,8 +2788,8 @@ function VorykenStore.request(method, url, value, extraHeaders)
     return ok, result, status, reason, nil
 end
 
--- Website JSON endpoint accepts a single PATCH object with one top-level key.
--- Do not PUT the entire file: that would erase Python's server records.
+-- New datos JSON endpoint accepts a single PATCH object with one top-level key.
+-- Do not PUT the entire file: that would erase reports from other scanners.
 local function writeEggToWebsite(recordKey, payload)
     local requester = getRequester()
     if type(requester) ~= "function" then
@@ -3924,7 +3924,7 @@ local filterStatus = make("TextLabel", {
     Position = UDim2.fromOffset(14, 404),
     Size = UDim2.fromOffset(274, 16),
     BackgroundTransparency = 1,
-    Text = "Firebase filter off • enter an amount",
+    Text = "API filter off • enter an amount",
     TextColor3 = COLORS.Gray,
     TextSize = 11,
     Font = Enum.Font.GothamMedium,
@@ -4064,11 +4064,11 @@ end
 local function refreshFilterStatus()
     local threshold = getAutoThreshold()
     if not threshold then
-        filterStatus.Text = "Firebase filter off • enter an amount"
+        filterStatus.Text = "API filter off • enter an amount"
         filterStatus.TextColor3 = COLORS.Gray
         return
     end
-    filterStatus.Text = "Firebase ON • " .. formatNumber(threshold) .. "+"
+    filterStatus.Text = "API ON • " .. formatNumber(threshold) .. "+"
     if serverHopEnabled then
         filterStatus.Text = filterStatus.Text .. " • HOP ON"
     end
