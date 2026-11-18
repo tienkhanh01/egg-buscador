@@ -2708,7 +2708,7 @@ end
 -- Python/Server Hop continues using the ORIGINAL Firebase below.
 -- Website PATCH writes exactly ONE independently named flat record per egg.
 --==============================================================
-local VORYKEN_API_ROOT = "https://servidorespyton-default-rtdb.firebaseio.com"  -- Python hop queue (unchanged)
+local VORYKEN_API_ROOT = "https://yyyyy-8e598-default-rtdb.europe-west1.firebasedatabase.app"  -- Python hop queue (unchanged)
 local VORYKEN_EGGS_API_URL = "https://codes.voryken.com/api/data/servidores.json"
 -- CLIENT-SIDE CREDENTIAL: accessible to anyone who can read this distributed Lua.
 -- Restrict this key to the minimum permissions possible and rotate if shared.
