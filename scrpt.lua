@@ -1,4 +1,6 @@
--- VORYKEN SCANNER • FIX DATOS: per-egg PUT as working collector, readback verification
+-- VORYKEN SCANNER • FIX 200 LOCALS • DATOS PER-EGG PUT VERIFY
+-- Fix: private helpers in lexical scopes, avoids Out of local registers.
+-- API publishing / 100M+ / Halloween / server hop unchanged.
 -- VORYKEN SCANNER • NUEVO DATOS HUEVOS / DATOS SEPARADO PARA SERVER HOP
 
 -- Voryken Egg Finder • Voryken API-only bootstrap
@@ -2795,6 +2797,10 @@ end
 -- PUT /db/<project>/path/to/record.json, NOT a full-document upload.
 -- Save each egg at ONE flat root key so the existing Finder FIX59 can read it.
 -- This NEVER does PUT at the project root and NEVER wipes any other record.
+local writeEggToWebsite
+-- All private DATOS helpers are scoped so they do not consume a register for
+-- the rest of this >5K-line scanner chunk (Luau limit: 200 locals).
+do
 local function datosRequest(method, url, value)
     local requester = getRequester()
     if type(requester) ~= "function" then
@@ -2867,7 +2873,7 @@ local function eggRecordMatches(record, payload)
         and tonumber(record.value) == tonumber(payload.value)
 end
 
-local function writeEggToWebsite(recordKey, payload)
+writeEggToWebsite = function(recordKey, payload)
     -- Flat per-egg record; this is the same nested PUT mechanism the Python
     -- collector uses for /finder/users/<uid>.json. Never PUT {} to the root.
     local projectRoot = VORYKEN_EGGS_API_URL:gsub("%.json$", "")
@@ -2908,6 +2914,7 @@ local function writeEggToWebsite(recordKey, payload)
     return false, patchStatus,
         "PATCH_NOT_VERIFIED (GET " .. tostring(readStatus or 0) .. "): " .. tostring(readError or "DATA_MISMATCH"):sub(1,80)
 end
+end -- private DATOS helper scope
 
 --==============================================================
 -- API CLOCK + 5 MINUTE CYCLE GUARD
@@ -3047,6 +3054,8 @@ task.spawn(function()
     pcall(CycleRuntime.cleanupOldEggs)
 end)
 
+local publishEntryToApi
+do
 local function apiSafeKey(value)
     local text = tostring(value or "")
     if text == "" then return "unknown" end
@@ -3063,7 +3072,7 @@ local function apiLocationForEntry(entry)
     return "Main World"
 end
 
-local function publishEntryToApi(entry, threshold)
+publishEntryToApi = function(entry, threshold)
     if CycleRuntime.hopBlocked() then
         return false, "CYCLE_GUARD"
     end
@@ -3126,6 +3135,7 @@ local function publishEntryToApi(entry, threshold)
     warn("[VORYKEN DATOS] EGG WRITE FAILED: " .. detail:sub(1, 190))
     return false, detail
 end
+end -- private egg field helpers
 
 local thumbnailCache = {}
 local animalImageCache = {}
@@ -3411,6 +3421,8 @@ end
 -- This also works when the Roblox image asset is private to the experience.
 --==============================================================
 
+local renderAnimalPng, buildDiscordMultipartFiles
+do
 local crc32Table = table.create(256)
 for i = 0, 255 do
     local crc = i
@@ -3525,7 +3537,7 @@ local function rgbaToPng(pixelBuffer, width, height)
         .. pngChunk("IEND", "")
 end
 
-local function renderAnimalPng(category, useEggIcon)
+renderAnimalPng = function(category, useEggIcon)
     category = tostring(category or "")
     if category == "" then
         return nil, "MISSING_CATEGORY"
@@ -3659,7 +3671,7 @@ local function renderAnimalPng(category, useEggIcon)
     return pngBytes, "OK"
 end
 
-local function buildDiscordMultipartFiles(payload, files)
+buildDiscordMultipartFiles = function(payload, files)
     local boundary = "----------------Finder"
         .. tostring(math.floor(os.clock() * 1000000))
         .. tostring(math.random(100000, 999999))
@@ -3688,6 +3700,7 @@ local function buildDiscordMultipartFiles(payload, files)
     parts[#parts + 1] = "--" .. boundary .. "--\r\n"
     return boundary, table.concat(parts)
 end
+end -- private PNG/multipart encoder scope
 
 local function rarityColor(rarity)
     return RARITY_COLORS[tostring(rarity or "")] or COLORS.Gray
@@ -3856,7 +3869,7 @@ refreshSelectionVisual = function()
     end
 end
 
-local webhookTitle = make("TextLabel", {
+make("TextLabel", {
     Position = UDim2.fromOffset(16, 324),
     Size = UDim2.fromOffset(308, 17),
     BackgroundTransparency = 1,
@@ -4055,7 +4068,6 @@ local apiPublishedUids = runtimeState.ApiPublishedUids
 runtimeState.ReportRetryAt = runtimeState.ReportRetryAt or {}
 local reportRetryAt = runtimeState.ReportRetryAt
 runtimeState.EggWriteAttempts = runtimeState.EggWriteAttempts or {}
-local eggWriteAttempts = runtimeState.EggWriteAttempts
 local serverHopBusy = false
 local serverHopQueuedAfterSend = false
 local lastServerHopAttempt = 0
@@ -5326,7 +5338,7 @@ function runtimeState._processAutomaticNotifications(topEntries, allEntries)
                     if not ok then
                         publishFailed = true
                         apiPublishedUids[uid] = nil
-                        eggWriteAttempts[uid] = (eggWriteAttempts[uid] or 0) + 1
+                        runtimeState.EggWriteAttempts[uid] = (runtimeState.EggWriteAttempts[uid] or 0) + 1
                         reportRetryAt[uid] = os.clock() + 3
                         filterStatus.Text = "Voryken Web ERROR • " .. tostring(runtimeState._lastEggPublishError or "NETWORK"):sub(1, 72)
                         filterStatus.TextColor3 = Color3.fromRGB(255, 92, 112)
@@ -5361,7 +5373,7 @@ function runtimeState._processAutomaticNotifications(topEntries, allEntries)
             local uid = tostring(entry.uid or "")
             if uid ~= "" and not apiPublishedUids[uid]
                 and (tonumber(entry.value) or 0) >= threshold
-                and (eggWriteAttempts[uid] or 0) < 2 then
+                and (runtimeState.EggWriteAttempts[uid] or 0) < 2 then
                 return
             end
         end
@@ -5576,7 +5588,7 @@ function runtimeState._publishNormalUidImmediate(uid, slotObject)
     local ok = publishEntryToApi(runtimeState._cloneEntry(entry), threshold)
     if not ok then
         apiPublishedUids[uid] = nil
-        eggWriteAttempts[uid] = (eggWriteAttempts[uid] or 0) + 1
+        runtimeState.EggWriteAttempts[uid] = (runtimeState.EggWriteAttempts[uid] or 0) + 1
         reportRetryAt[uid] = os.clock() + 3
         filterStatus.Text = "Voryken Web SEND ERROR • " .. tostring(runtimeState._lastEggPublishError or "NETWORK"):sub(1, 64)
         filterStatus.TextColor3 = Color3.fromRGB(255, 92, 112)
@@ -5634,7 +5646,7 @@ function runtimeState._publishHalloweenImmediate()
                 filterStatus.TextColor3 = COLORS.Green
             else
                 apiPublishedUids[uid] = nil
-                eggWriteAttempts[uid] = (eggWriteAttempts[uid] or 0) + 1
+                runtimeState.EggWriteAttempts[uid] = (runtimeState.EggWriteAttempts[uid] or 0) + 1
                 reportRetryAt[uid] = os.clock() + 3
             end
         end
