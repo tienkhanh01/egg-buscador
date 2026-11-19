@@ -1,3 +1,4 @@
+-- VORYKEN SCANNER • FIX DATOS: per-egg PUT as working collector, readback verification
 -- VORYKEN SCANNER • NUEVO DATOS HUEVOS / DATOS SEPARADO PARA SERVER HOP
 
 -- Voryken Egg Finder • Voryken API-only bootstrap
@@ -222,6 +223,8 @@ if tostring(runtimeState.JobId or "") ~= currentJobId then
     runtimeState.Generation = 0
     runtimeState.AutoNotifiedUids = {}
     runtimeState.ApiPublishedUids = {}
+    runtimeState.EggWriteAttempts = {}
+    runtimeState.ReportRetryAt = {}
 end
 
 runtimeState.Generation = (tonumber(runtimeState.Generation) or 0) + 1
@@ -2704,9 +2707,9 @@ local function getRequester()
 end
 
 --==============================================================
--- EGG REPORTS -> NEW VORYKEN DATOS PROJECT (separate from server queue)
+-- EGG REPORTS -> DATOS PROJECT (verified per-egg PUT; separate queue)
 -- Python/Server Hop keeps using its existing, separate datos.voryken.com project.
--- Egg PATCH writes ONE independently named flat record per egg.
+-- Egg PUT writes ONE independently named flat record per egg.
 --==============================================================
 local VORYKEN_API_ROOT = "https://datos.voryken.com/db/prj_x5Z2Wb3c2O1JMZ0KJoI-ksOT8jE"
 local VORYKEN_QUEUE_API_KEY = "vk_XmqaNVDV4ok3j-VRCEEmBMHwmZvxsWSNXL_A9NXguhudxsQZ"
@@ -2788,70 +2791,122 @@ function VorykenStore.request(method, url, value, extraHeaders)
     return ok, result, status, reason, nil
 end
 
--- New datos JSON endpoint accepts a single PATCH object with one top-level key.
--- Do not PUT the entire file: that would erase reports from other scanners.
-local function writeEggToWebsite(recordKey, payload)
+-- DATOS API: the working Python collector and the server-hop queue use
+-- PUT /db/<project>/path/to/record.json, NOT a full-document upload.
+-- Save each egg at ONE flat root key so the existing Finder FIX59 can read it.
+-- This NEVER does PUT at the project root and NEVER wipes any other record.
+local function datosRequest(method, url, value)
     local requester = getRequester()
     if type(requester) ~= "function" then
-        return false, nil, "HTTP_REQUEST_UNAVAILABLE"
+        -- Same HTTP fallback as the already-working queue client.
+        requester = function(opts) return HttpService:RequestAsync(opts) end
     end
 
-    local encodedOk, body = pcall(function()
-        return HttpService:JSONEncode({ [recordKey] = payload })
-    end)
-    if not encodedOk then
-        return false, nil, "JSON_ENCODE_ERROR"
-    end
-
-    local opts = {
-        Url = VORYKEN_EGGS_API_URL,
-        Method = "PATCH",
-        Timeout = 6,
+    local options = {
+        Url = url,
+        Method = method,
+        Timeout = 7,
         Headers = {
             ["X-API-Key"] = VORYKEN_EGGS_API_KEY,
-            ["Content-Type"] = "application/json",
             ["Accept"] = "application/json",
-            ["Cache-Control"] = "no-cache",
+            ["Content-Type"] = "application/json",
         },
-        Body = body,
     }
+    if value ~= nil then
+        local ok, body = pcall(HttpService.JSONEncode, HttpService, value)
+        if not ok then return false, nil, 0, "ENCODE: " .. tostring(body):sub(1,90) end
+        options.Body = body
+    end
 
-    -- Bound each attempt even when an executor request hangs.
-    local done, success, response = false, false, nil
+    local finished, called, response = false, false, nil
     task.spawn(function()
-        success, response = pcall(requester, opts)
-        done = true
+        called, response = pcall(requester, options)
+        finished = true
     end)
-    local deadline = os.clock() + 6.5
-    while not done and os.clock() < deadline do
-        task.wait(0.03)
+    local deadline = os.clock() + 7.5
+    while not finished and os.clock() < deadline and isCurrentVorykenRun() do
+        task.wait(0.05)
     end
-    if not done then
-        return false, nil, "WEB_API_TIMEOUT"
-    end
-    if not success then
-        return false, nil, "WEB_API_REQUEST_FAILED: " .. tostring(response):sub(1, 100)
-    end
+    if not finished then return false, nil, 0, "TIMEOUT_7S" end
+    if not called then return false, nil, 0, "REQUEST: " .. tostring(response):sub(1,130) end
 
-    local status = type(response) == "table" and tonumber(
-        response.StatusCode or response.Status or response.status or response.status_code
-    ) or nil
-    local raw = type(response) == "table" and (
-        response.Body or response.body or response.ResponseBody or response.responseBody
-    ) or (type(response) == "string" and response or "")
-    local rawText = tostring(raw or "")
+    local status = nil
+    local body = nil
+    if type(response) == "table" then
+        status = tonumber(response.StatusCode or response.Status or response.status or response.status_code)
+        body = response.Body or response.body or response.ResponseBody or response.responseBody
+        if response.Success == false and not status then
+            return false, nil, 0, "REQUEST_FAILED"
+        end
+    elseif type(response) == "string" then
+        body = response
+    end
+    body = tostring(body or "")
 
-    if rawText:find("/cdn-cgi/access/login", 1, true)
-        or rawText:lower():find("<!doctype html", 1, true) then
-        return false, status, "CLOUDFLARE_ACCESS_BLOCKED"
+    if body:lower():find("<!doctype html", 1, true)
+        or body:find("/cdn-cgi/access/login", 1, true) then
+        return false, nil, status or 0, "HTML_OR_CLOUDFLARE"
     end
     if not status then
-        return false, nil, "WEB_API_NO_STATUS"
+        return false, nil, 0, "NO_HTTP_STATUS"
     end
     if status < 200 or status >= 300 then
-        return false, status, "WEB_API_HTTP_" .. tostring(status) .. ": " .. rawText:sub(1, 110)
+        return false, nil, status, "HTTP_" .. tostring(status) .. ": " .. body:sub(1,130)
     end
-    return true, status, nil
+
+    if body == "" or body == "null" then return true, nil, status, nil end
+    local ok, parsed = pcall(HttpService.JSONDecode, HttpService, body)
+    if ok then return true, parsed, status, nil end
+    return false, nil, status, "INVALID_JSON: " .. body:sub(1,85)
+end
+
+local function eggRecordMatches(record, payload)
+    return type(record) == "table"
+        and tostring(record.uid or "") == tostring(payload.uid)
+        and tostring(record.jobId or "") == tostring(payload.jobId)
+        and tonumber(record.value) == tonumber(payload.value)
+end
+
+local function writeEggToWebsite(recordKey, payload)
+    -- Flat per-egg record; this is the same nested PUT mechanism the Python
+    -- collector uses for /finder/users/<uid>.json. Never PUT {} to the root.
+    local projectRoot = VORYKEN_EGGS_API_URL:gsub("%.json$", "")
+    local recordUrl = projectRoot .. "/" .. tostring(recordKey) .. ".json"
+    local ok, data, status, reason = datosRequest("PUT", recordUrl, payload)
+    if ok then
+        if eggRecordMatches(data, payload) then return true, status, nil end
+        -- Some APIs answer 204/empty on successful PUT. Read the saved record
+        -- so a superficial 2xx response cannot be mistaken for publication.
+        local readOk, confirmed, readStatus, readError = datosRequest("GET", recordUrl)
+        if readOk and eggRecordMatches(confirmed, payload) then
+            return true, status, nil
+        end
+        return false, status,
+            "PUT_NOT_VERIFIED (GET " .. tostring(readStatus or 0) .. "): " .. tostring(readError or "DATA_MISMATCH"):sub(1,80)
+    end
+
+    -- Compatibility only if the backend explicitly does not implement child PUT.
+    -- On authentication errors or timeouts, NEVER fall back to another write.
+    if status ~= 404 and status ~= 405 and status ~= 501 then
+        return false, status, "EGG_PUT " .. tostring(reason)
+    end
+    local patched, patchResult, patchStatus, patchError =
+        datosRequest("PATCH", VORYKEN_EGGS_API_URL, { [recordKey] = payload })
+    if not patched then
+        return false, patchStatus, "PUT " .. tostring(reason):sub(1,65)
+            .. " | PATCH " .. tostring(patchError):sub(1,65)
+    end
+    if type(patchResult) == "table" then
+        if eggRecordMatches(patchResult[recordKey], payload) then
+            return true, patchStatus, nil
+        end
+    end
+    local readOk, confirmed, readStatus, readError = datosRequest("GET", recordUrl)
+    if readOk and eggRecordMatches(confirmed, payload) then
+        return true, patchStatus, nil
+    end
+    return false, patchStatus,
+        "PATCH_NOT_VERIFIED (GET " .. tostring(readStatus or 0) .. "): " .. tostring(readError or "DATA_MISMATCH"):sub(1,80)
 end
 
 --==============================================================
@@ -3057,17 +3112,18 @@ local function publishEntryToApi(entry, threshold)
     local ok, status, reason = writeEggToWebsite(recordKey, payload)
     if ok then
         runtimeState._lastEggPublishError = nil
+        runtimeState._lastEggPublishMethod = "PUT_PER_EGG_VERIFIED"
         runtimeState._lastEggPublishedJob = jobId
         runtimeState._lastEggPublishedUid = uid
         runtimeState._lastEggPublishedAt = os.clock()
-        print("[VORYKEN WEB API] SENT " .. tostring(entry.name or "")
+        print("[VORYKEN DATOS] VERIFIED " .. tostring(entry.name or "")
             .. " | JobId=" .. jobId .. " | UID=" .. uid)
         return true, status
     end
 
     local detail = tostring(reason or "WEB_API_ERROR")
     runtimeState._lastEggPublishError = detail
-    warn("[VORYKEN WEB API] PATCH FAILED: " .. detail:sub(1, 190))
+    warn("[VORYKEN DATOS] EGG WRITE FAILED: " .. detail:sub(1, 190))
     return false, detail
 end
 
@@ -3998,6 +4054,8 @@ local autoNotifiedUids = runtimeState.AutoNotifiedUids
 local apiPublishedUids = runtimeState.ApiPublishedUids
 runtimeState.ReportRetryAt = runtimeState.ReportRetryAt or {}
 local reportRetryAt = runtimeState.ReportRetryAt
+runtimeState.EggWriteAttempts = runtimeState.EggWriteAttempts or {}
+local eggWriteAttempts = runtimeState.EggWriteAttempts
 local serverHopBusy = false
 local serverHopQueuedAfterSend = false
 local lastServerHopAttempt = 0
@@ -5268,7 +5326,8 @@ function runtimeState._processAutomaticNotifications(topEntries, allEntries)
                     if not ok then
                         publishFailed = true
                         apiPublishedUids[uid] = nil
-                        reportRetryAt[uid] = os.clock() + 6
+                        eggWriteAttempts[uid] = (eggWriteAttempts[uid] or 0) + 1
+                        reportRetryAt[uid] = os.clock() + 3
                         filterStatus.Text = "Voryken Web ERROR • " .. tostring(runtimeState._lastEggPublishError or "NETWORK"):sub(1, 72)
                         filterStatus.TextColor3 = Color3.fromRGB(255, 92, 112)
                     end
@@ -5281,13 +5340,30 @@ function runtimeState._processAutomaticNotifications(topEntries, allEntries)
 
     if matchingCount > 0 then
         if publishFailed then
-            filterStatus.Text = "Voryken Web report failed • moving on: "
-                .. tostring(runtimeState._lastEggPublishError or "retry pending"):sub(1, 60)
+            filterStatus.Text = "Voryken DATOS error • "
+                .. tostring(runtimeState._lastEggPublishError or "retry pending"):sub(1, 68)
             filterStatus.TextColor3 = Color3.fromRGB(255, 92, 112)
-            warn("[VORYKEN REPORT] Egg upload failed. Check Voryken website API key, PATCH permission, and JSON endpoint.")
+            if os.clock() - (tonumber(runtimeState._lastEggErrorWarningAt) or -100) > 5 then
+                runtimeState._lastEggErrorWarningAt = os.clock()
+                warn("[VORYKEN DATOS] Egg upload failed: " .. tostring(runtimeState._lastEggPublishError or "UNKNOWN"):sub(1, 130))
+            end
         else
             filterStatus.Text = "Voryken Web sent • " .. tostring(matchingCount) .. " match" .. (matchingCount == 1 and "" or "es")
             filterStatus.TextColor3 = COLORS.Green
+        end
+    end
+
+    if matchingCount > 0 and publishFailed then
+        -- A failed network write is NOT a delivered egg. Keep this server long
+        -- enough for one bounded retry (3s), then continue the original hop.
+        -- Without this, the prior scanner teleported away after one 401/403.
+        for _, entry in ipairs(topEntries or {}) do
+            local uid = tostring(entry.uid or "")
+            if uid ~= "" and not apiPublishedUids[uid]
+                and (tonumber(entry.value) or 0) >= threshold
+                and (eggWriteAttempts[uid] or 0) < 2 then
+                return
+            end
         end
     end
 
@@ -5500,7 +5576,8 @@ function runtimeState._publishNormalUidImmediate(uid, slotObject)
     local ok = publishEntryToApi(runtimeState._cloneEntry(entry), threshold)
     if not ok then
         apiPublishedUids[uid] = nil
-        reportRetryAt[uid] = os.clock() + 6
+        eggWriteAttempts[uid] = (eggWriteAttempts[uid] or 0) + 1
+        reportRetryAt[uid] = os.clock() + 3
         filterStatus.Text = "Voryken Web SEND ERROR • " .. tostring(runtimeState._lastEggPublishError or "NETWORK"):sub(1, 64)
         filterStatus.TextColor3 = Color3.fromRGB(255, 92, 112)
         return false
@@ -5557,7 +5634,8 @@ function runtimeState._publishHalloweenImmediate()
                 filterStatus.TextColor3 = COLORS.Green
             else
                 apiPublishedUids[uid] = nil
-                reportRetryAt[uid] = os.clock() + 6
+                eggWriteAttempts[uid] = (eggWriteAttempts[uid] or 0) + 1
+                reportRetryAt[uid] = os.clock() + 3
             end
         end
     end
